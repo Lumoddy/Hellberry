@@ -1,0 +1,10 @@
+{
+  "name": "hellberry",
+  "version": "0.0.0",
+  "type": "module",
+  "main": "index.ts",
+  "dependencies": {
+    "@types/node": "^26.1.2",
+    "serialport": "^13.0.0"
+  }
+}
