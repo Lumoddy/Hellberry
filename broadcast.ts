@@ -1,10 +1,8 @@
-// import * as net from "node:net";
-import * as sp from "serialport";
 import * as dgram from "dgram";
 
 const client = dgram.createSocket("udp4");
 
-const BROADCAST_ADDR = "255.255.255.255";
+const BROADCAST_ADDR = "192.168.8.255";
 const PORT = 41234;
 const message = Buffer.from("Hello LAN! This is a Node.js broadcast.");
 
@@ -17,7 +15,7 @@ client.bind(() =>
         if (err)
             console.error("Failed to send broadcast:", err);
         else
-            console.log(`Broadcast message sent to ${BROADCAST_ADDR}:${PORT}`);
+            console.log(`Broadcast message sent to ${BROADCAST_ADDR}:${PORT} from ${client.address().address}:${client.address().port}`);
 
         client.close();
     });
