@@ -2,8 +2,7 @@ import * as sp from "serialport";
 import { BeadInterface } from "./bead/interface.ts";
 
 sp.SerialPort.list()
-    // .then((x) => void console.log(x))
-    .then((x) => x.find((x) => x.serialNumber === "34333323832351B0B241"))
+    .then((x) => x.find((x) => x.manufacturer !== undefined && /Arduino/i.test(x.manufacturer)))
     .then((info) =>
     {
         if (info === undefined)

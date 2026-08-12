@@ -1,25 +1,19 @@
 import * as dgram from "dgram";
 import * as sp from "serialport";
-import { unescapeByte, parsePacket, IncomingPacket, START } from "./packet/incoming.js";
-import { encodePacket, OutgoingPacket } from "./packet/outgoing.js";
+import { BeadInterface } from "./bead/interface.ts";
 
 const server = dgram.createSocket("udp4");
 
 /// Allow incoming via UDP to a destination with this port in firewall.
 const PORT = 41234;
 
-server.on("message", (msg, rinfo) =>
-{
-    console.log(`Received broadcast: "${msg}" from ${rinfo.address}:${rinfo.port}`);
-});
-
-server.on("listening", () =>
+server.bind(PORT, () =>
 {
     const address = server.address();
     console.log(`Receiver listening on ${address.address}:${address.port}`);
 
     sp.SerialPort.list()
-        .then((x) => x.find((x) => x.serialNumber === "34333323832351C052F1"))
+        .then((x) => x.find((x) => x.manufacturer !== undefined && /Arduino/i.test(x.manufacturer)))
         .then((info) =>
         {
             if (info === undefined)
@@ -29,87 +23,41 @@ server.on("listening", () =>
 
             port.on("open", () =>
             {
+                const bead = new BeadInterface(port);
+
                 console.log(`Serial port ${info.path} opened at ${port.baudRate} baud`);
 
-                setTimeout(() =>
+                setTimeout(async () =>
                 {
-                    let unescape = unescapeByte();
-                    unescape.next();
-                    let parser = parsePacket(false);
-                    parser.next();
+                    await bead.connect();
 
-                    const instance = serialInterface((packet) =>
+                    await bead.setPinMode("3", "digital-output");
+
+                    server.on("message", (message, rinfo) =>
                     {
-                        console.log(encodePacket(packet));
+                        const string = message.toString("ascii");
 
-                        port.write(encodePacket(packet), (err) =>
+                        switch (string)
                         {
-                            if (err)
-                                console.error("Error writing to serial port:", err);
-                            else
-                                console.log(`Send '${packet.type}'`);
-                        });
-                    });
-                    instance.next();
-
-                    port.on("data", (data) =>
-                    {
-                        console.log(data);
-
-                        for (const byte of data)
-                        {
-                            const { done: unescapedDone, value: unescapedByte } = unescape.next(byte);
-                            if (!unescapedDone) continue;
-                            unescape = unescapeByte();
-                            unescape.next();
-
-                            if (unescapedByte === START)
+                            case "bead-detected":
                             {
-                                parser = parsePacket(false);
-                                parser.next();
+                                bead.setPinPower("3", true);
+                                break;
                             }
-                            else
+                            case "bead-undetected":
                             {
-                                const { done: packetDone, value: packet } = parser.next(unescapedByte);
-                                if (!packetDone) continue;
-                                parser = parsePacket(false);
-                                parser.next();
-
-                                instance.next(packet);
+                                bead.setPinPower("3", false);
+                                break;
+                            }
+                            default:
+                            {
+                                console.warn(`Received unknown broadcast: "${string}" from ${rinfo.address}:${rinfo.port}`);
+                                break;
                             }
                         }
-                    });
-
-                    port.on("error", (err) =>
-                    {
-                        console.error("Serial port error:", err);
                     });
                 },
                     2000);
             });
         });
 });
-
-server.bind(PORT);
-
-function* serialInterface(send: (packet: OutgoingPacket) => void)
-    : Generator<undefined, never, IncomingPacket>
-{
-    send({ type: "get-config" });
-
-    const config = (yield);
-    if (config.type !== "whole-config")
-        throw new Error("Failed to initialize interface");
-
-    console.log("config", config);
-
-    while (true)
-    {
-        console.log(yield);
-
-        // switch (packet.type)
-        // {
-        //     case ""
-        // }
-    }
-}
