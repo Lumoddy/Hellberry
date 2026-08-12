@@ -1,8 +1,7 @@
-import { Stream } from "node:stream";
 import { PinMode, PinState } from "../pin.js";
 
-const CONTROL_BYTE = "".charCodeAt(0);
-const START_TEXT_BYTE = "".charCodeAt(0);
+const CTRL_BYTE = "".charCodeAt(0);
+const START_BYTE = "".charCodeAt(0);
 
 export interface OutgoingPacketMap
 {
@@ -23,27 +22,27 @@ export function encodePacket(packet: OutgoingPacket): Uint8Array
     {
         case "ping":
         {
-            return new Uint8Array([0x00]);
+            return new Uint8Array([CTRL_BYTE, START_BYTE, 0x00]);
         }
         case "get-config":
         {
-            return new Uint8Array([0x01]);
+            return new Uint8Array([CTRL_BYTE, START_BYTE, 0x01]);
         }
         case "get-pin":
         {
             const id = packet.id;
-            if (id === CONTROL_BYTE)
-                return new Uint8Array([0x02, CONTROL_BYTE, CONTROL_BYTE]);
+            if (id === CTRL_BYTE)
+                return new Uint8Array([CTRL_BYTE, START_BYTE, 0x02, CTRL_BYTE, CTRL_BYTE]);
             else
-                return new Uint8Array([0x02, id]);
+                return new Uint8Array([CTRL_BYTE, START_BYTE, 0x02, id]);
         }
         case "get-pin-mode":
         {
             const id = packet.id;
-            if (id === CONTROL_BYTE)
-                return new Uint8Array([0x03, CONTROL_BYTE, CONTROL_BYTE]);
+            if (id === CTRL_BYTE)
+                return new Uint8Array([CTRL_BYTE, START_BYTE, 0x03, CTRL_BYTE, CTRL_BYTE]);
             else
-                return new Uint8Array([0x03, id]);
+                return new Uint8Array([CTRL_BYTE, START_BYTE, 0x03, id]);
         }
         case "set-pin":
         {
@@ -58,10 +57,10 @@ export function encodePacket(packet: OutgoingPacket): Uint8Array
             }
 
             const id = packet.id;
-            if (id === CONTROL_BYTE)
-                return new Uint8Array([0x02, CONTROL_BYTE, CONTROL_BYTE, state]);
+            if (id === CTRL_BYTE)
+                return new Uint8Array([CTRL_BYTE, START_BYTE, 0x04, CTRL_BYTE, CTRL_BYTE, state]);
             else
-                return new Uint8Array([0x02, id, state]);
+                return new Uint8Array([CTRL_BYTE, START_BYTE, 0x04, id, state]);
         }
         case "set-pin-mode":
         {
@@ -77,10 +76,10 @@ export function encodePacket(packet: OutgoingPacket): Uint8Array
             }
 
             const id = packet.id;
-            if (id === CONTROL_BYTE)
-                return new Uint8Array([0x02, CONTROL_BYTE, CONTROL_BYTE, mode]);
+            if (id === CTRL_BYTE)
+                return new Uint8Array([CTRL_BYTE, START_BYTE, 0x05, CTRL_BYTE, CTRL_BYTE, mode]);
             else
-                return new Uint8Array([0x02, id, mode]);
+                return new Uint8Array([CTRL_BYTE, START_BYTE, 0x05, id, mode]);
         }
         default:
         {

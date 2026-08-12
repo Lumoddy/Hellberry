@@ -10,6 +10,8 @@
     "noFallthroughCasesInSwitch": true,
     "useUnknownInCatchVariables": true,
     "target": "ES2024",
-    "module": "CommonJS"
+    "module": "CommonJS",
+    "allowImportingTsExtensions": true,
+    "noEmit": true
   }
 }

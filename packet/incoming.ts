@@ -1,5 +1,5 @@
-import { Transform, TransformCallback, TransformOptions } from "node:stream";
-import { PinMode, PinState } from "../pin.js";
+import { TransformOptions } from "node:stream";
+import type { PinMode, PinState } from "../pin.js";
 
 export interface IncomingPacketMap
 {
@@ -26,12 +26,12 @@ export interface IncomingPacketParserOptions extends TransformOptions
     littleEndian?: boolean | undefined | null,
 }
 
-const START = -1;
+export const START = -1;
 
 const CONTROL_BYTE = "".charCodeAt(0);
 const START_TEXT_BYTE = "".charCodeAt(0);
 
-function* unescapeByte(): Generator<undefined, number, number | typeof START>
+export function* unescapeByte(): Generator<undefined, number, number | typeof START>
 {
     const byte = (yield) & 0xFF;
 
@@ -39,6 +39,8 @@ function* unescapeByte(): Generator<undefined, number, number | typeof START>
     {
         case CONTROL_BYTE:
         {
+            const byte = (yield) & 0xFF;
+
             switch (byte)
             {
                 case CONTROL_BYTE: return CONTROL_BYTE;
@@ -118,7 +120,7 @@ function* parseString(littleEndian: boolean): Generator<undefined, string, numbe
     return String.fromCharCode(...buffer);
 }
 
-function* parsePacket(littleEndian: boolean): Generator<undefined, IncomingPacket, number>
+export function* parsePacket(littleEndian: boolean): Generator<undefined, IncomingPacket, number>
 {
     switch ((yield) & 0xFF)
     {
@@ -188,87 +190,6 @@ function* parsePacket(littleEndian: boolean): Generator<undefined, IncomingPacke
         {
             throw new SyntaxError(
                 `parsePacket: Invalid packet type value.`);
-        }
-    }
-}
-
-export class IncomingPacketParser extends Transform
-{
-    #littleEndian: boolean;
-    #escaper: Generator<unknown, number, number>;
-    #parser: Generator<unknown, IncomingPacket, number>;
-
-    constructor(options: IncomingPacketParserOptions)
-    {
-        super(options);
-
-        this.#littleEndian = options.littleEndian ?? true;
-        if (typeof this.#littleEndian !== "number")
-            throw new TypeError(
-                `new IncomingPacketParser: Option littleEndian is not a number.`);
-
-        this.#escaper = unescapeByte();
-        this.#escaper.next();
-        this.#parser = parsePacket(this.#littleEndian);
-        this.#parser.next();
-    }
-
-    override _transform(chunk: unknown, _encoding: BufferEncoding, callback: TransformCallback)
-    {
-        if (!(this instanceof IncomingPacketParser))
-            throw new TypeError(
-                `'_transform' called on an object that does not implement interface IncomingPacketParser.`);
-
-        switch (true)
-        {
-            case chunk === null || typeof chunk !== "object":
-            {
-                throw new TypeError(
-                    `IncomingPacketParser._transform: Argument 1 is not an object.`);
-            }
-            case chunk instanceof Uint8Array:
-            {
-                try
-                {
-                    const length = chunk.length;
-                    for (let i = 0; i < length; i += 1)
-                    {
-                        const { done, value: byte } = this.#escaper.next(chunk[i]);
-                        if (!done) continue;
-                        this.#escaper = unescapeByte();
-                        this.#escaper.next();
-                        if (byte === START)
-                        {
-                            this.#parser = parsePacket(this.#littleEndian);
-                            this.#parser.next();
-                        }
-                        else
-                        {
-                            const { done, value } = this.#parser.next(byte);
-                            if (!done) continue;
-                            this.#parser = parsePacket(this.#littleEndian);
-                            this.#parser.next();
-                            this.push(value);
-                        }
-                    }
-
-                    callback();
-                }
-                catch (error)
-                {
-                    if (error instanceof SyntaxError)
-                        callback(error);
-                    else
-                        throw error;
-                }
-
-                break;
-            }
-            default:
-            {
-                throw new TypeError(
-                    `IncomingPacketParser._transform: Argument 1 does not implement interface Uint8Array.`);
-            }
         }
     }
 }
