@@ -2,7 +2,7 @@ import type { PinMode, BeadConfig, BeadPinConfig } from "./interface.ts";
 
 export interface IncomingPacketObjectMap
 {
-    "pong": {},
+    "pong": { },
     "config": BeadConfig,
     "get-pin-power-response": { power: number},
     "get-pin-mode-response": { mode: PinMode},
@@ -87,7 +87,7 @@ export function* deserializePacket(): Generator<undefined, IncomingPacket | null
             const power = yield* deserializeUint16();
             if (power === null)
                 return null;
-            
+
             return { type: "pin-listen", pin, power: power / 1023 };
         }
         case 101:

@@ -1,14 +1,14 @@
 {
   "name": "hellberry",
-  "version": "0.0.0",
+  "scripts": {
+    "start": "node ./main.ts"
+  },
   "type": "module",
-  "main": "index.ts",
   "dependencies": {
-    "@types/node": "^26.1.2",
+    "typescript": "^5.9.3",
     "serialport": "^13.0.0"
   },
   "devDependencies": {
-    "tsx": "^4.23.6",
-    "typescript": "^7.0.2"
+    "@types/node": "^26.6.3"
   }
 }

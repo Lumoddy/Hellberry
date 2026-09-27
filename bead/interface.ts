@@ -1,7 +1,7 @@
-import { EventEmitter } from "node:events";
+import { EventEmitter } from "events";
 import { SerialPort } from "serialport";
 import { deserializePacket, type IncomingPacket } from "./incoming.ts";
-import type { DuplexEventMap } from "node:stream";
+import type { DuplexEventMap } from "stream";
 import { serialize } from "./outgoing.ts";
 
 export type PinMode =
@@ -76,8 +76,6 @@ export class BeadInterface extends EventEmitter<BeadInterfaceEventMap>
 
                     if (value === null)
                         continue;
-
-                    console.log("in", value.type === "config" ? "configured" : value);
 
                     switch (value.type)
                     {
@@ -186,8 +184,6 @@ export class BeadInterface extends EventEmitter<BeadInterfaceEventMap>
 
         if (this.#configResolve !== null)
         {
-            
-            console.log("out", serialize("whole-config"));
             this.#serialPort.write(serialize("whole-config"));
             await this.#configPromise;
         }
@@ -200,7 +196,7 @@ export class BeadInterface extends EventEmitter<BeadInterfaceEventMap>
 
     async config(): Promise<BeadConfig>
     {
-        return { ...await this.#configPromise };
+        return structuredClone(await this.#configPromise);
     }
 
     async idOfPin(pin: number | string): Promise<number>
@@ -227,8 +223,8 @@ export class BeadInterface extends EventEmitter<BeadInterfaceEventMap>
             if (pin < 0 || pin >= config.pins.length)
                 throw new RangeError(
                     `BeadInterface.idOfPin: Pin '${pin}' is out of range.`);
-                
-                return Math.trunc(pin);
+
+            return Math.trunc(pin);
         }
         else
             throw new TypeError(
@@ -239,8 +235,6 @@ export class BeadInterface extends EventEmitter<BeadInterfaceEventMap>
     {
         return new Promise(async (resolve, reject) =>
         {
-            
-            console.log("out", serialize("ping"));
             this.#pingResolves.push(resolve, reject);
             this.#serialPort.write(serialize("ping"));
         });
@@ -250,8 +244,6 @@ export class BeadInterface extends EventEmitter<BeadInterfaceEventMap>
     {
         return new Promise(async (resolve, reject) =>
         {
-            
-            console.log("out", serialize("get-pin-power", await this.idOfPin(pin)));
             this.#setPinPowerResolves.push(resolve, reject);
             this.#serialPort.write(serialize("get-pin-power", await this.idOfPin(pin)));
         });
@@ -261,8 +253,6 @@ export class BeadInterface extends EventEmitter<BeadInterfaceEventMap>
     {
         return new Promise(async (resolve, reject) =>
         {
-            
-            console.log("out", serialize("get-pin-mode", await this.idOfPin(pin)));
             this.#setPinModeResolves.push(resolve, reject);
             this.#serialPort.write(serialize("get-pin-mode", await this.idOfPin(pin)));
         });
@@ -272,8 +262,6 @@ export class BeadInterface extends EventEmitter<BeadInterfaceEventMap>
     {
         return new Promise(async (resolve, reject) =>
         {
-            
-            console.log("out", serialize("set-pin-power", await this.idOfPin(pin), power));
             this.#setPinPowerResolves.push(resolve, reject);
             this.#serialPort.write(serialize("set-pin-power", await this.idOfPin(pin), power));
         });
@@ -283,8 +271,6 @@ export class BeadInterface extends EventEmitter<BeadInterfaceEventMap>
     {
         return new Promise(async (resolve, reject) =>
         {
-            
-            console.log("out", serialize("set-pin-mode", await this.idOfPin(pin), mode));
             this.#setPinModeResolves.push(resolve, reject);
             this.#serialPort.write(serialize("set-pin-mode", await this.idOfPin(pin), mode));
         });

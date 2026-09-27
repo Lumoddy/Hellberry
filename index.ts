@@ -1,4 +1,4 @@
-// import * as net from "node:net";
+// import * as net from "net";
 import * as sp from "serialport";
 import * as dgram from "dgram";
 
