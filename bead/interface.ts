@@ -29,6 +29,14 @@ export interface BeadPinConfig
 export interface BeadInterfaceEventMap
 {
     "pin-changed": [pin: number, power: boolean],
+    "close": [];
+    "end": [];
+    "error": [err: Error];
+}
+
+export interface BeadInterfaceOptions
+{
+    readonly serialPort: SerialPort,
 }
 
 export class BeadInterface extends EventEmitter<BeadInterfaceEventMap>
@@ -36,17 +44,24 @@ export class BeadInterface extends EventEmitter<BeadInterfaceEventMap>
     #serialPort: SerialPort;
     #deserializer: Generator<undefined, IncomingPacket | null, number>;
     #dataListener: (...args: DuplexEventMap["data"]) => void;
+    #closeListener: (...args: DuplexEventMap["close"]) => void;
+    #endListener: (...args: DuplexEventMap["end"]) => void;
+    #errorListener: (...args: DuplexEventMap["error"]) => void;
     #configPromise: Promise<BeadConfig>;
-    #configResolve: ((arg?: any) => void) | null = null;
+    #configResolve: ((arg?: any) => void) | null;
     #pingResolves: ((arg?: any) => void)[] = [];
     #getPinPowerResolves: ((arg?: any) => void)[] = [];
     #getPinModeResolves: ((arg?: any) => void)[] = [];
     #setPinPowerResolves: ((arg?: any) => void)[] = [];
     #setPinModeResolves: ((arg?: any) => void)[] = [];
 
-    constructor(serialPort: SerialPort)
+    get serialPort(): SerialPort { return this.#serialPort }
+
+    constructor(options: BeadInterfaceOptions)
     {
         super();
+
+        const serialPort = options.serialPort;
 
         if (serialPort === null || typeof serialPort !== "object")
             throw new TypeError(
@@ -60,6 +75,7 @@ export class BeadInterface extends EventEmitter<BeadInterfaceEventMap>
         this.#deserializer = deserializePacket();
         this.#deserializer.next();
 
+        this.#configResolve = null;
         this.#configPromise = new Promise((resolve) => this.#configResolve = resolve);
 
         this.#dataListener = (data) =>
@@ -176,10 +192,23 @@ export class BeadInterface extends EventEmitter<BeadInterfaceEventMap>
                 }
             }
         };
+
+        this.#closeListener = () => this.emit("close");
+        serialPort.on("close", this.#closeListener);
+
+        this.#endListener = () => this.emit("end");
+        serialPort.on("end", this.#endListener);
+
+        this.#errorListener = (err) => this.emit("error", err);
+        serialPort.on("error", this.#errorListener);
     }
 
-    async connect()
+    async connect(): Promise<void>
     {
+        if (!(this instanceof BeadInterface))
+            throw new TypeError(
+                `'connect' called on an object that does not implement interface BeadInterface.`);
+
         this.#serialPort.on("data", this.#dataListener);
 
         if (this.#configResolve !== null)
@@ -191,16 +220,28 @@ export class BeadInterface extends EventEmitter<BeadInterfaceEventMap>
 
     disconnect()
     {
+        if (!(this instanceof BeadInterface))
+            throw new TypeError(
+                `'disconnect' called on an object that does not implement interface BeadInterface.`);
+
         this.#serialPort.off("data", this.#dataListener);
     }
 
     async config(): Promise<BeadConfig>
     {
+        if (!(this instanceof BeadInterface))
+            throw new TypeError(
+                `'config' called on an object that does not implement interface BeadInterface.`);
+
         return structuredClone(await this.#configPromise);
     }
 
     async idOfPin(pin: number | string): Promise<number>
     {
+        if (!(this instanceof BeadInterface))
+            throw new TypeError(
+                `'idOfPin' called on an object that does not implement interface BeadInterface.`);
+
         const config = await this.#configPromise;
 
         if (typeof pin === "string")
@@ -233,6 +274,10 @@ export class BeadInterface extends EventEmitter<BeadInterfaceEventMap>
 
     ping(): Promise<void>
     {
+        if (!(this instanceof BeadInterface))
+            throw new TypeError(
+                `'ping' called on an object that does not implement interface BeadInterface.`);
+
         return new Promise(async (resolve, reject) =>
         {
             this.#pingResolves.push(resolve, reject);
@@ -242,6 +287,10 @@ export class BeadInterface extends EventEmitter<BeadInterfaceEventMap>
 
     getPinPower(pin: number | string): Promise<number>
     {
+        if (!(this instanceof BeadInterface))
+            throw new TypeError(
+                `'getPinPower' called on an object that does not implement interface BeadInterface.`);
+
         return new Promise(async (resolve, reject) =>
         {
             this.#setPinPowerResolves.push(resolve, reject);
@@ -251,6 +300,10 @@ export class BeadInterface extends EventEmitter<BeadInterfaceEventMap>
 
     getPinMode(pin: number | string): Promise<PinMode>
     {
+        if (!(this instanceof BeadInterface))
+            throw new TypeError(
+                `'getPinMode' called on an object that does not implement interface BeadInterface.`);
+
         return new Promise(async (resolve, reject) =>
         {
             this.#setPinModeResolves.push(resolve, reject);
@@ -260,6 +313,10 @@ export class BeadInterface extends EventEmitter<BeadInterfaceEventMap>
 
     setPinPower(pin: number | string, power: number | boolean): Promise<void>
     {
+        if (!(this instanceof BeadInterface))
+            throw new TypeError(
+                `'setPinPower' called on an object that does not implement interface BeadInterface.`);
+
         return new Promise(async (resolve, reject) =>
         {
             this.#setPinPowerResolves.push(resolve, reject);
@@ -269,6 +326,10 @@ export class BeadInterface extends EventEmitter<BeadInterfaceEventMap>
 
     setPinMode(pin: number | string, mode: PinMode): Promise<void>
     {
+        if (!(this instanceof BeadInterface))
+            throw new TypeError(
+                `'setPinMode' called on an object that does not implement interface BeadInterface.`);
+
         return new Promise(async (resolve, reject) =>
         {
             this.#setPinModeResolves.push(resolve, reject);
