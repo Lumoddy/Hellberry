@@ -29,6 +29,8 @@ export interface BeadPinConfig
 export interface BeadInterfaceEventMap
 {
     "pin-changed": [pin: number, power: boolean],
+    "pin-power-set": [pin: number, power: number | boolean],
+    "pin-mode-set": [pin: number, mode: PinMode],
     "close": [];
     "end": [];
     "error": [err: Error];
@@ -259,7 +261,7 @@ export class BeadInterface extends EventEmitter<BeadInterfaceEventMap>
 
             return found;
         }
-        else if (typeof pin === "number")
+        else if (typeof pin === "number" && Number.isInteger(pin))
         {
             if (pin < 0 || pin >= config.pins.length)
                 throw new RangeError(
@@ -269,7 +271,37 @@ export class BeadInterface extends EventEmitter<BeadInterfaceEventMap>
         }
         else
             throw new TypeError(
-                `BeadInterface.idOfPin: Argument 1 is not a number or string.`);
+                `BeadInterface.idOfPin: Argument 1 is not an integer or string.`);
+    }
+
+    async nameOfPin(pin: number | string): Promise<string>
+    {
+        if (!(this instanceof BeadInterface))
+            throw new TypeError(
+                `'nameOfPin' called on an object that does not implement interface BeadInterface.`);
+
+        const config = await this.#configPromise;
+
+        if (typeof pin === "string")
+        {
+            for (const configPin of config.pins)
+                if (configPin.name === pin)
+                    return pin;
+
+            throw new RangeError(
+                `BeadInterface.nameOfPin: Pin '${pin}' not found in config.`);
+        }
+        else if (typeof pin === "number" && Number.isInteger(pin))
+        {
+            if (pin < 0 || pin >= config.pins.length)
+                throw new RangeError(
+                    `BeadInterface.idOfPin: Pin '${pin}' is out of range.`);
+
+            return config.pins[pin].name;
+        }
+        else
+            throw new TypeError(
+                `BeadInterface.nameOfPin: Argument 1 is not an integer or string.`);
     }
 
     ping(): Promise<void>
@@ -281,6 +313,7 @@ export class BeadInterface extends EventEmitter<BeadInterfaceEventMap>
         return new Promise(async (resolve, reject) =>
         {
             this.#pingResolves.push(resolve, reject);
+            await this.#configPromise;
             this.#serialPort.write(serialize("ping"));
         });
     }
@@ -320,7 +353,9 @@ export class BeadInterface extends EventEmitter<BeadInterfaceEventMap>
         return new Promise(async (resolve, reject) =>
         {
             this.#setPinPowerResolves.push(resolve, reject);
-            this.#serialPort.write(serialize("set-pin-power", await this.idOfPin(pin), power));
+            const pinId = await this.idOfPin(pin);
+            this.#serialPort.write(serialize("set-pin-power", pinId, power));
+            this.emit("pin-power-set", pinId, power);
         });
     }
 
@@ -333,7 +368,9 @@ export class BeadInterface extends EventEmitter<BeadInterfaceEventMap>
         return new Promise(async (resolve, reject) =>
         {
             this.#setPinModeResolves.push(resolve, reject);
-            this.#serialPort.write(serialize("set-pin-mode", await this.idOfPin(pin), mode));
+            const pinId = await this.idOfPin(pin);
+            this.#serialPort.write(serialize("set-pin-mode", pinId, mode));
+            this.emit("pin-mode-set", pinId, mode);
         });
     }
 }

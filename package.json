@@ -5,10 +5,12 @@
   },
   "type": "module",
   "dependencies": {
+    "serialport": "^13.0.0",
     "typescript": "^5.9.3",
-    "serialport": "^13.0.0"
+    "ws": "^8.22.0"
   },
   "devDependencies": {
-    "@types/node": "^26.6.3"
+    "@types/node": "^26.6.3",
+    "@types/ws": "^8.18.2"
   }
 }
