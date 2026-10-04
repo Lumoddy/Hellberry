@@ -2,15 +2,15 @@ import * as http from "http";
 import * as path from "path";
 import * as ws from "ws";
 import * as os from "os";
-import { BeadInterface } from "./bead/interface.ts";
+import { BeadInterface, type PinMode } from "./bead/interface.ts";
 import { SerialHandler } from "./serial_handler/interface.ts";
 
-type Config =
+export type AppConfig =
 {
     port: number,
 };
 
-export function runApp(config: Config)
+export function runApp(config: AppConfig)
 {
     const appPort = config.port;
 
@@ -24,6 +24,49 @@ export function runApp(config: Config)
 
     wss.on("connection", (ws, request) =>
     {
+        interface IncomingPacketMap
+        {
+            "ping": { },
+            "whole-config": { },
+            "get-pin-power": { device: string, pin: string },
+            "get-pin-mode": { device: string, pin: string },
+            "set-pin-power": { device: string, pin: string, power: number | boolean },
+            "set-pin-mode": { device: string, pin: string, mode: PinMode },
+        }
+
+        interface OutgoingPacketMap
+        {
+            "pong": { },
+            "config":
+            {
+                devices:
+                {
+                    name: string,
+                    pins:
+                    {
+                        name: string,
+                        supportsDigitalInput: boolean,
+                        supportsDigitalOutput: boolean,
+                        supportsAnalogInput: boolean,
+                        supportsAnalogOutput: boolean,
+                    }[],
+                }[],
+            },
+            "get-pin-power-response": { power: number},
+            "get-pin-mode-response": { mode: PinMode},
+            "set-pin-power-response": { },
+            "set-pin-mode-response": { },
+            "pin-listen": { pin: number, power: number },
+            "invalid-pin-mode": { },
+            "invalid-pin-id": { },
+            "invalid-packet-id": { },
+            "invalid-write-to-input": { },
+            "invalid-unsupported-mode": { },
+            "invalid-escape": { },
+        }
+
+        type OutgoingPacket = ObjectFromMap<OutgoingPacketMap>;
+
         ws.on("message", (message) =>
         {
             
@@ -81,8 +124,6 @@ export function runApp(config: Config)
             construct: BeadInterface,
             created(handler)
             {
-                setTimeout(() => handler.connect(), 2000);
-
                 handler.on("pin-changed", (pin, power) =>
                 {
                     for (const ws of wss.clients)

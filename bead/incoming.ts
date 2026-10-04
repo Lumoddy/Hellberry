@@ -14,19 +14,21 @@ export interface IncomingPacketObjectMap
     "invalid-packet-id": { },
     "invalid-write-to-input": { },
     "invalid-unsupported-mode": { },
-    "invalid-invalid-escape": { },
+    "invalid-escape": { },
 }
 
-export type IncomingPacket = { [K in keyof IncomingPacketObjectMap]: { type: K } & IncomingPacketObjectMap[K] }[keyof IncomingPacketObjectMap];
+export type IncomingPacket = ObjectFromMap<IncomingPacketObjectMap>;
 
 const CONTROL_ESCAPE = 16;
 const CONTROL_START = 2;
 
-export function* deserializePacket(): Generator<undefined, IncomingPacket | null, number>
+export const RESET = Symbol("reset");
+
+export function* deserializePacket(): Generator<undefined, IncomingPacket | typeof RESET, number>
 {
     const type = yield* deserializeUint8();
-    if (type === null)
-        return null;
+    if (type === RESET)
+        return RESET;
 
     switch (type)
     {
@@ -37,27 +39,27 @@ export function* deserializePacket(): Generator<undefined, IncomingPacket | null
         case 1:
         {
             const name = yield* deserializeString();
-            if (name === null)
-                return null;
+            if (name === RESET)
+                return RESET;
             const pins = yield* deserializeArray(deserializePinConfig);
-            if (pins === null)
-                return null;
+            if (pins === RESET)
+                return RESET;
 
             return { type: "config", name, pins };
         }
         case 2:
         {
             const power = yield* deserializeUint16();
-            if (power === null)
-                return null;
+            if (power === RESET)
+                return RESET;
 
             return { type: "get-pin-power-response", power: power / 1023 };
         }
         case 3:
         {
             const mode = yield* deserializeUint8();
-            if (mode === null)
-                return null;
+            if (mode === RESET)
+                return RESET;
 
             switch (mode)
             {
@@ -82,11 +84,11 @@ export function* deserializePacket(): Generator<undefined, IncomingPacket | null
         case 6:
         {
             const pin = yield* deserializeUint8();
-            if (pin === null)
-                return null;
+            if (pin === RESET)
+                return RESET;
             const power = yield* deserializeUint16();
-            if (power === null)
-                return null;
+            if (power === RESET)
+                return RESET;
 
             return { type: "pin-listen", pin, power: power / 1023 };
         }
@@ -112,7 +114,7 @@ export function* deserializePacket(): Generator<undefined, IncomingPacket | null
         }
         case 106:
         {
-            return { type: "invalid-invalid-escape" };
+            return { type: "invalid-escape" };
         }
         default:
             throw new SyntaxError(
@@ -120,7 +122,7 @@ export function* deserializePacket(): Generator<undefined, IncomingPacket | null
     }
 }
 
-export function* deserializeUint8(): Generator<undefined, number | null, number>
+export function* deserializeUint8(): Generator<undefined, number | typeof RESET, number>
 {
     const byte1 = Number(yield) & 0xFF;
     if (byte1 != CONTROL_ESCAPE)
@@ -129,52 +131,52 @@ export function* deserializeUint8(): Generator<undefined, number | null, number>
     const byte2 = Number(yield) & 0xFF;
     switch (byte2)
     {
-        case CONTROL_ESCAPE: return CONTROL_ESCAPE;
-        case CONTROL_START: return null;
+        case CONTROL_ESCAPE: return byte2;
+        case CONTROL_START: return RESET;
         default:
             throw new SyntaxError(
                 `deserialize: Invalid escape sequence.`);
     }
 }
 
-export function* deserializeUint16(): Generator<undefined, number | null, number>
+export function* deserializeUint16(): Generator<undefined, number | typeof RESET, number>
 {
     const byte0 = yield* deserializeUint8();
-    if (byte0 === null)
-        return null;
+    if (byte0 === RESET)
+        return RESET;
     const byte1 = yield* deserializeUint8();
-    if (byte1 === null)
-        return null;
+    if (byte1 === RESET)
+        return RESET;
     return byte0 | (byte1 << 8);
 }
 
-export function deserializeLength(): Generator<undefined, number | null, number>
+export function deserializeLength(): Generator<undefined, number | typeof RESET, number>
 {
     return deserializeUint16();
 }
 
-export function* deserializeString(): Generator<undefined, string | null, number>
+export function* deserializeString(): Generator<undefined, string | typeof RESET, number>
 {
     const buffer = yield* deserializeArray(deserializeUint8);
-    if (buffer === null)
-        return null;
+    if (buffer === RESET)
+        return RESET;
     return String.fromCharCode(...buffer);
 }
 
 export function* deserializeArray<T>(
-    deserialize: () => Generator<undefined, T | null, number>): Generator<undefined, T[] | null, number>
+    deserialize: () => Generator<undefined, T | typeof RESET, number>): Generator<undefined, T[] | typeof RESET, number>
 {
     const len = yield* deserializeLength();
-    if (len === null)
-        return null;
+    if (len === RESET)
+        return RESET;
 
     const buffer = new Array(len);
 
     for (let i = 0; i < len; i += 1)
     {
         const item = yield* deserialize();
-        if (item === null)
-            return null;
+        if (item === RESET)
+            return RESET;
 
         buffer[i] = item;
     }
@@ -182,14 +184,14 @@ export function* deserializeArray<T>(
     return buffer;
 }
 
-export function* deserializePinConfig(): Generator<undefined, BeadPinConfig | null, number>
+export function* deserializePinConfig(): Generator<undefined, BeadPinConfig | typeof RESET, number>
 {
     const name = yield* deserializeString();
-    if (name === null)
-        return null;
+    if (name === RESET)
+        return RESET;
     const flags = yield* deserializeUint8();
-    if (flags === null)
-        return null;
+    if (flags === RESET)
+        return RESET;
 
     return (
     {

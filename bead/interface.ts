@@ -1,7 +1,5 @@
 import { EventEmitter } from "events";
-import { SerialPort } from "serialport";
-import { deserializePacket, type IncomingPacket } from "./incoming.ts";
-import type { DuplexEventMap } from "stream";
+import { deserializePacket, RESET, type IncomingPacket } from "./incoming.ts";
 import { serialize } from "./outgoing.ts";
 
 export type PinMode =
@@ -28,349 +26,532 @@ export interface BeadPinConfig
 
 export interface BeadInterfaceEventMap
 {
-    "pin-changed": [pin: number, power: boolean],
-    "pin-power-set": [pin: number, power: number | boolean],
-    "pin-mode-set": [pin: number, mode: PinMode],
-    "close": [];
-    "end": [];
-    "error": [err: Error];
+    "packet": [packet: IncomingPacket],
+    "packet-error": [error: SyntaxError],
+    "pin-changed": [pin: number, name: string, power: number],
+    "reset": [],
 }
 
 export interface BeadInterfaceOptions
 {
-    readonly serialPort: SerialPort,
+    readonly source: BeadInterfaceSource,
 }
+
+export interface BeadInterfaceSource
+{
+    write(data: Buffer<ArrayBuffer>): void;
+    on(type: "data", listener: (data: Iterable<number>) => undefined): void;
+}
+
+const PING = 0;
+const WHOLE_CONFIG = 1;
+const GET_PIN_POWER = 2;
+const GET_PIN_MODE = 3;
+const SET_PIN_POWER = 4;
+const SET_PIN_MODE = 5;
 
 export class BeadInterface extends EventEmitter<BeadInterfaceEventMap>
 {
-    #serialPort: SerialPort;
-    #deserializer: Generator<undefined, IncomingPacket | null, number>;
-    #dataListener: (...args: DuplexEventMap["data"]) => void;
-    #closeListener: (...args: DuplexEventMap["close"]) => void;
-    #endListener: (...args: DuplexEventMap["end"]) => void;
-    #errorListener: (...args: DuplexEventMap["error"]) => void;
-    #configPromise: Promise<BeadConfig>;
-    #configResolve: ((arg?: any) => void) | null;
-    #pingResolves: ((arg?: any) => void)[] = [];
-    #getPinPowerResolves: ((arg?: any) => void)[] = [];
-    #getPinModeResolves: ((arg?: any) => void)[] = [];
-    #setPinPowerResolves: ((arg?: any) => void)[] = [];
-    #setPinModeResolves: ((arg?: any) => void)[] = [];
-
-    get serialPort(): SerialPort { return this.#serialPort }
+    #source: BeadInterfaceSource;
+    #deserializer: Generator<undefined, IncomingPacket | typeof RESET, number>;
+    #dataListener: (data: Iterable<number>) => undefined;
+    #config: BeadConfig | null;
+    #attemptSend: () => void;
+    #attemptInterval: NodeJS.Timeout | null;
+    #queue: any[] = [WHOLE_CONFIG, serialize({ type: "whole-config" })];
 
     constructor(options: BeadInterfaceOptions)
     {
         super();
 
-        const serialPort = options.serialPort;
-
-        if (serialPort === null || typeof serialPort !== "object")
-            throw new TypeError(
-                `new BeadInterface: Argument 1 is not an object.`);
-        else if (!(serialPort instanceof SerialPort))
-            throw new TypeError(
-                `new BeadInterface: Argument 1 does not implement interface SerialPort.`);
-
-        this.#serialPort = serialPort;
-
         this.#deserializer = deserializePacket();
         this.#deserializer.next();
 
-        this.#configResolve = null;
-        this.#configPromise = new Promise((resolve) => this.#configResolve = resolve);
-
         this.#dataListener = (data) =>
         {
-            console.log(data);
-
             for (const byte of data)
             {
-                const { done, value } = this.#deserializer.next(byte);
+                let done, value;
+
+                try { ({ done, value } = this.#deserializer.next(byte)) }
+                catch (error)
+                {
+                    this.#deserializer = deserializePacket();
+                    this.#deserializer.next();
+
+                    if (error instanceof SyntaxError)
+                        this.emit("packet-error", error);
+                }
+
                 if (done)
                 {
                     this.#deserializer = deserializePacket();
                     this.#deserializer.next();
 
-                    if (value === null)
-                        continue;
-
-                    switch (value.type)
+                    if (value === RESET)
+                        this.emit("reset");
+                    else
                     {
-                        case "pong":
-                        {
-                            for (let i = 0; i < this.#pingResolves.length; i += 2)
-                                this.#pingResolves[i]();
-                            this.#pingResolves.length = 0;
-                            break;
-                        }
-                        case "config":
-                        {
-                            this.#configResolve?.(value);
-                            this.#configResolve = null;
-                            break;
-                        }
-                        case "get-pin-power-response":
-                        {
-                            for (let i = 0; i < this.#getPinPowerResolves.length; i += 2)
-                                this.#getPinPowerResolves[i](value.power);
-                            this.#getPinPowerResolves.length = 0;
-                            break;
-                        }
-                        case "get-pin-mode-response":
-                        {
-                            for (let i = 0; i < this.#getPinModeResolves.length; i += 2)
-                                this.#getPinModeResolves[i](value.mode);
-                            this.#getPinModeResolves.length = 0;
-                            break;
-                        }
-                        case "set-pin-power-response":
-                        {
-                            for (let i = 0; i < this.#setPinPowerResolves.length; i += 2)
-                                this.#setPinPowerResolves[i]();
-                            this.#setPinPowerResolves.length = 0;
-                            break;
-                        }
-                        case "set-pin-mode-response":
-                        {
-                            for (let i = 0; i < this.#setPinModeResolves.length; i += 2)
-                                this.#setPinModeResolves[i]();
-                            this.#setPinModeResolves.length = 0;
-                            break;
-                        }
-                        case "pin-listen":
-                        {
-                            this.emit("pin-changed", value.pin, value.power > 0);
-                            break;
-                        }
-                        case "invalid-pin-mode":
-                        case "invalid-pin-id":
-                        case "invalid-packet-id":
-                        case "invalid-write-to-input":
-                        case "invalid-unsupported-mode":
-                        case "invalid-invalid-escape":
-                        {
-                            if (this.#pingResolves.length === 0
-                                && this.#getPinPowerResolves.length === 0
-                                && this.#getPinModeResolves.length === 0
-                                && this.#setPinPowerResolves.length === 0
-                                && this.#setPinModeResolves.length === 0)
-                            {
-                                switch (value.type)
-                                {
-                                    case "invalid-pin-mode":
-                                        throw new Error(`BeadInterface: Invalid pin mode.`);
-                                    case "invalid-pin-id":
-                                        throw new Error(`BeadInterface: Invalid pin id.`);
-                                    case "invalid-packet-id":
-                                        throw new Error(`BeadInterface: Invalid packet id.`);
-                                    case "invalid-write-to-input":
-                                        throw new Error(`BeadInterface: Invalid write to input.`);
-                                    case "invalid-unsupported-mode":
-                                        throw new Error(`BeadInterface: Invalid unsupported mode.`);
-                                    case "invalid-invalid-escape":
-                                        throw new Error(`BeadInterface: Invalid invalid escape.`);
-                                }
-                            }
+                        const packet = value as IncomingPacket;
 
-                            for (let i = 1; i < this.#pingResolves.length; i += 2)
-                                this.#pingResolves[i](value.type);
-                            this.#pingResolves.length = 0;
-                            for (let i = 1; i < this.#getPinPowerResolves.length; i += 2)
-                                this.#getPinPowerResolves[i](value.type);
-                            this.#getPinPowerResolves.length = 0;
-                            for (let i = 1; i < this.#getPinModeResolves.length; i += 2)
-                                this.#getPinModeResolves[i](value.type);
-                            this.#getPinModeResolves.length = 0;
-                            for (let i = 1; i < this.#setPinPowerResolves.length; i += 2)
-                                this.#setPinPowerResolves[i](value.type);
-                            this.#setPinPowerResolves.length = 0;
-                            for (let i = 1; i < this.#setPinModeResolves.length; i += 2)
-                                this.#setPinModeResolves[i](value.type);
-                            this.#setPinModeResolves.length = 0;
-                            break;
+                        switch (packet.type)
+                        {
+                            case "pong":
+                            {
+                                break;
+                            }
+                            case "config":
+                            {
+                                this.#config =
+                                {
+                                    name: packet.name,
+                                    pins: packet.pins.map((pin) => (
+                                    {
+                                        name: pin.name,
+                                        supportsDigitalInput: pin.supportsDigitalInput,
+                                        supportsDigitalOutput: pin.supportsDigitalOutput,
+                                        supportsAnalogInput: pin.supportsAnalogInput,
+                                        supportsAnalogOutput: pin.supportsAnalogOutput,
+                                    })),
+                                };
+
+                                switch (this.#queue[0])
+                                {
+                                    case WHOLE_CONFIG:
+                                    {
+                                        let i = 2;
+                                        while (typeof this.#queue[i] === "function")
+                                        {
+                                            Function.prototype.call.call(
+                                                this.#queue[i],
+                                                this,
+                                                null,
+                                                {
+                                                    name: packet.name,
+                                                    pins: packet.pins.map((pin) => (
+                                                    {
+                                                        name: pin.name,
+                                                        supportsDigitalInput: pin.supportsDigitalInput,
+                                                        supportsDigitalOutput: pin.supportsDigitalOutput,
+                                                        supportsAnalogInput: pin.supportsAnalogInput,
+                                                        supportsAnalogOutput: pin.supportsAnalogOutput,
+                                                    })),
+                                                });
+
+                                            i += 1;
+                                        }
+
+                                        this.#queue.splice(0, i);
+
+                                        break;
+                                    }
+                                }
+
+                                break;
+                            }
+                            case "get-pin-power-response":
+                            {
+                                switch (this.#queue[0])
+                                {
+                                    case GET_PIN_POWER:
+                                    {
+                                        let i = 2;
+                                        while (typeof this.#queue[i] === "function")
+                                        {
+                                            Function.prototype.call.call(this.#queue[i],this, null, packet.power);
+                                            i += 1;
+                                        }
+
+                                        this.#queue.splice(0, i);
+
+                                        break;
+                                    }
+                                }
+
+                                break;
+                            }
+                            case "get-pin-mode-response":
+                            {
+                                switch (this.#queue[0])
+                                {
+                                    case GET_PIN_MODE:
+                                    {
+                                        let i = 2;
+                                        while (typeof this.#queue[i] === "function")
+                                        {
+                                            Function.prototype.call.call(this.#queue[i],this, null, packet.mode);
+                                            i += 1;
+                                        }
+
+                                        this.#queue.splice(0, i);
+
+                                        break;
+                                    }
+                                }
+
+                                break;
+                            }
+                            case "set-pin-power-response":
+                            {
+                                switch (this.#queue[0])
+                                {
+                                    case SET_PIN_POWER:
+                                    {
+                                        let i = 2;
+                                        while (typeof this.#queue[i] === "function")
+                                        {
+                                            Function.prototype.call.call(this.#queue[i],this, null);
+                                            i += 1;
+                                        }
+
+                                        this.#queue.splice(0, i);
+
+                                        break;
+                                    }
+                                }
+
+                                break;
+                            }
+                            case "set-pin-mode-response":
+                            {
+                                switch (this.#queue[0])
+                                {
+                                    case SET_PIN_MODE:
+                                    {
+                                        let i = 2;
+                                        while (typeof this.#queue[i] === "function")
+                                        {
+                                            Function.prototype.call.call(this.#queue[i],this, null);
+                                            i += 1;
+                                        }
+
+                                        this.#queue.splice(0, i);
+
+                                        break;
+                                    }
+                                }
+
+                                break;
+                            }
+                            case "pin-listen":
+                            {
+                                this.emit(
+                                    "pin-changed",
+                                    packet.pin,
+                                    (this.#config as BeadConfig).pins[packet.pin].name,
+                                    packet.power);
+                                break;
+                            }
+                            case "invalid-pin-mode":
+                            {
+                                console.warn("\x1B[33m/!\\\x1B[0m Received report of an invalid pin mode.");
+                                break;
+                            }
+                            case "invalid-pin-id":
+                            {
+                                switch (this.#queue[0])
+                                {
+                                    case GET_PIN_POWER:
+                                    case GET_PIN_MODE:
+                                    case SET_PIN_POWER:
+                                    case SET_PIN_MODE:
+                                    {
+                                        let i = 2;
+                                        while (typeof this.#queue[i] === "function")
+                                        {
+                                            Function.prototype.call.call(this.#queue[i],this, "invalid-pin-id");
+                                            i += 1;
+                                        }
+
+                                        this.#queue.splice(0, i);
+
+                                        break;
+                                    }
+                                }
+
+                                console.warn("\x1B[33m/!\\\x1B[0m Received report of an invalid pin id.");
+                                break;
+                            }
+                            case "invalid-packet-id":
+                            {
+                                console.warn("\x1B[33m/!\\\x1B[0m Received report of an invalid packet id.");
+                                break;
+                            }
+                            case "invalid-write-to-input":
+                            {
+                                switch (this.#queue[0])
+                                {
+                                    case SET_PIN_POWER:
+                                    case SET_PIN_MODE:
+                                    {
+                                        let i = 2;
+                                        while (typeof this.#queue[i] === "function")
+                                        {
+                                            Function.prototype.call.call(this.#queue[i],this, "invalid-write-to-input");
+                                            i += 1;
+                                        }
+
+                                        this.#queue.splice(0, i);
+
+                                        break;
+                                    }
+                                }
+
+                                console.warn("\x1B[33m/!\\\x1B[0m Received report of an invalid write to input.");
+                                break;
+                            }
+                            case "invalid-unsupported-mode":
+                            {
+                                switch (this.#queue[0])
+                                {
+                                    case SET_PIN_MODE:
+                                    {
+                                        let i = 2;
+                                        while (typeof this.#queue[i] === "function")
+                                        {
+                                            Function.prototype.call.call(this.#queue[i],this, "invalid-unsupported-mode");
+                                            i += 1;
+                                        }
+
+                                        this.#queue.splice(0, i);
+
+                                        break;
+                                    }
+                                }
+
+                                console.warn("\x1B[33m/!\\\x1B[0m Received report of the assignment of an unsupported pin mode.");
+                                break;
+                            }
+                            case "invalid-escape":
+                            {
+                                console.warn("\x1B[33m/!\\\x1B[0m Received report of an invalid escape.");
+                                break;
+                            }
+                        }
+
+                        this.emit("packet", packet);
+
+                        this.#attemptSend();
+
+                        if (this.#queue.length === 0)
+                        {
+                            if (this.#attemptInterval !== null)
+                            {
+                                this.#attemptInterval.close();
+                                this.#attemptInterval = null;
+                            }
+                        }
+                        else
+                        {
+                            if (this.#attemptInterval === null)
+                                this.#attemptInterval = setInterval(this.#attemptSend, 500);
+                            else
+                                this.#attemptInterval.refresh();
                         }
                     }
                 }
             }
         };
 
-        this.#closeListener = () => this.emit("close");
-        serialPort.on("close", this.#closeListener);
+        this.#source = options.source;
+        this.#source.on("data", this.#dataListener);
 
-        this.#endListener = () => this.emit("end");
-        serialPort.on("end", this.#endListener);
+        this.#config = null;
 
-        this.#errorListener = (err) => this.emit("error", err);
-        serialPort.on("error", this.#errorListener);
+        this.#attemptSend = () => this.#source.write(this.#queue[1]);
+        this.#attemptInterval = setInterval(this.#attemptSend, 500);
     }
 
-    async connect(): Promise<void>
+    pinIdToName(
+        id: number,
+        callback: (this: BeadInterface, error: "invalid-pin-id" | null, name: string) => void)
     {
-        if (!(this instanceof BeadInterface))
-            throw new TypeError(
-                `'connect' called on an object that does not implement interface BeadInterface.`);
-
-        this.#serialPort.on("data", this.#dataListener);
-
-        if (this.#configResolve !== null)
+        if (this.#config === null)
         {
-            this.#serialPort.write(serialize("whole-config"));
-            await this.#configPromise;
-        }
-    }
+            let i = 2;
+            while (typeof this.#queue[i] === "function") { i += 1 }
 
-    disconnect()
-    {
-        if (!(this instanceof BeadInterface))
-            throw new TypeError(
-                `'disconnect' called on an object that does not implement interface BeadInterface.`);
-
-        this.#serialPort.off("data", this.#dataListener);
-    }
-
-    async config(): Promise<BeadConfig>
-    {
-        if (!(this instanceof BeadInterface))
-            throw new TypeError(
-                `'config' called on an object that does not implement interface BeadInterface.`);
-
-        return structuredClone(await this.#configPromise);
-    }
-
-    async idOfPin(pin: number | string): Promise<number>
-    {
-        if (!(this instanceof BeadInterface))
-            throw new TypeError(
-                `'idOfPin' called on an object that does not implement interface BeadInterface.`);
-
-        const config = await this.#configPromise;
-
-        if (typeof pin === "string")
-        {
-            let found;
-            const pins = config.pins;
-            const length = pins.length;
-            for (let i = 0; i < length; i += 1)
-                if (pins[i].name === pin)
-                    found = i;
-
-            if (found === undefined)
-                throw new RangeError(
-                    `BeadInterface.idOfPin: Pin "${pin}" not found in config.`);
-
-            return found;
-        }
-        else if (typeof pin === "number" && Number.isInteger(pin))
-        {
-            if (pin < 0 || pin >= config.pins.length)
-                throw new RangeError(
-                    `BeadInterface.idOfPin: Pin '${pin}' is out of range.`);
-
-            return Math.trunc(pin);
+            this.#queue.splice(i, 0, (_: null, config: BeadConfig) =>
+            {
+                const pin = config.pins[id];
+                if (pin === undefined)
+                    Function.prototype.call.call(callback, "invalid-pin-id");
+                else
+                    Function.prototype.call.call(callback, null, pin.name);
+            });
         }
         else
-            throw new TypeError(
-                `BeadInterface.idOfPin: Argument 1 is not an integer or string.`);
+        {
+            const pin = this.#config.pins[id];
+            if (pin === undefined)
+                Function.prototype.call.call(callback, "invalid-pin-id");
+            else
+                Function.prototype.call.call(callback, null, pin.name);
+        }
     }
 
-    async nameOfPin(pin: number | string): Promise<string>
+    pinNameToId(
+        name: string,
+        callback: (this: BeadInterface, error: "invalid-pin-id" | null, id: number) => void)
     {
-        if (!(this instanceof BeadInterface))
-            throw new TypeError(
-                `'nameOfPin' called on an object that does not implement interface BeadInterface.`);
-
-        const config = await this.#configPromise;
-
-        if (typeof pin === "string")
+        if (this.#config === null)
         {
-            for (const configPin of config.pins)
-                if (configPin.name === pin)
-                    return pin;
+            let i = 2;
+            while (typeof this.#queue[i] === "function") { i += 1 }
 
-            throw new RangeError(
-                `BeadInterface.nameOfPin: Pin '${pin}' not found in config.`);
-        }
-        else if (typeof pin === "number" && Number.isInteger(pin))
-        {
-            if (pin < 0 || pin >= config.pins.length)
-                throw new RangeError(
-                    `BeadInterface.idOfPin: Pin '${pin}' is out of range.`);
+            this.#queue.splice(i, 0, (_: null, config: BeadConfig) =>
+            {
+                for (let i = 0; i < config.pins.length; i += 1)
+                {
+                    if (config.pins[i].name === name)
+                        return Function.prototype.call.call(callback, null, i);
+                }
 
-            return config.pins[pin].name;
+                Function.prototype.call.call(callback, "invalid-pin-id");
+            });
         }
         else
-            throw new TypeError(
-                `BeadInterface.nameOfPin: Argument 1 is not an integer or string.`);
+        {
+            for (let i = 0; i < this.#config.pins.length; i += 1)
+            {
+                if (this.#config.pins[i].name === name)
+                    return Function.prototype.call.call(callback, null, i);
+            }
+
+            Function.prototype.call.call(callback, "invalid-pin-id");
+        }
     }
 
-    ping(): Promise<void>
+    getPinPower(
+        pin: number | string,
+        callback: (this: BeadInterface, error: "invalid-pin-id" | null, power: number) => void): void
     {
-        if (!(this instanceof BeadInterface))
-            throw new TypeError(
-                `'ping' called on an object that does not implement interface BeadInterface.`);
-
-        return new Promise(async (resolve, reject) =>
+        if (typeof pin === "string")
         {
-            this.#pingResolves.push(resolve, reject);
-            await this.#configPromise;
-            this.#serialPort.write(serialize("ping"));
-        });
+            this.pinNameToId(pin, (error, pin) =>
+            {
+                if (error !== null)
+                    return Function.prototype.call.call(callback, "invalid-pin-id");
+
+                this.#queue.push(GET_PIN_POWER, serialize({ type: "get-pin-power", id: pin }), callback);
+            });
+        }
+        else
+        {
+            if (this.#queue.length === 0)
+            {
+                if (this.#attemptInterval === null)
+                    this.#attemptInterval = setInterval(this.#attemptSend, 500);
+                else
+                    this.#attemptInterval.refresh();
+
+                this.#attemptSend();
+            }
+
+            this.#queue.push(GET_PIN_POWER, serialize({ type: "get-pin-power", id: pin }), callback);
+        }
     }
 
-    getPinPower(pin: number | string): Promise<number>
+    getPinMode(
+        pin: number | string,
+        callback: (this: BeadInterface, error: "invalid-pin-id" | null, mode: PinMode) => void): void
     {
-        if (!(this instanceof BeadInterface))
-            throw new TypeError(
-                `'getPinPower' called on an object that does not implement interface BeadInterface.`);
-
-        return new Promise(async (resolve, reject) =>
+        if (typeof pin === "string")
         {
-            this.#setPinPowerResolves.push(resolve, reject);
-            this.#serialPort.write(serialize("get-pin-power", await this.idOfPin(pin)));
-        });
+            this.pinNameToId(pin, (error, pin) =>
+            {
+                if (error !== null)
+                    return Function.prototype.call.call(callback, "invalid-pin-id");
+
+                this.#queue.push(GET_PIN_MODE, serialize({ type: "get-pin-mode", id: pin }), callback);
+            });
+        }
+        else
+        {
+            if (this.#queue.length === 0)
+            {
+                if (this.#attemptInterval === null)
+                    this.#attemptInterval = setInterval(this.#attemptSend, 500);
+                else
+                    this.#attemptInterval.refresh();
+
+                this.#attemptSend();
+            }
+
+            this.#queue.push(GET_PIN_MODE, serialize({ type: "get-pin-mode", id: pin }), callback);
+        }
     }
 
-    getPinMode(pin: number | string): Promise<PinMode>
+    setPinPower(
+        pin: number | string,
+        power: number | boolean,
+        callback: (this: BeadInterface, error: "invalid-pin-id" | null) => void): void
     {
-        if (!(this instanceof BeadInterface))
-            throw new TypeError(
-                `'getPinMode' called on an object that does not implement interface BeadInterface.`);
-
-        return new Promise(async (resolve, reject) =>
+        if (typeof pin === "string")
         {
-            this.#setPinModeResolves.push(resolve, reject);
-            this.#serialPort.write(serialize("get-pin-mode", await this.idOfPin(pin)));
-        });
+            this.pinNameToId(pin, (error, pin) =>
+            {
+                if (error !== null)
+                    return Function.prototype.call.call(callback, "invalid-pin-id");
+
+                this.#queue.push(GET_PIN_POWER, serialize({ type: "set-pin-power", id: pin, power }), callback);
+            });
+        }
+        else
+        {
+            if (this.#queue.length === 0)
+            {
+                if (this.#attemptInterval === null)
+                    this.#attemptInterval = setInterval(this.#attemptSend, 500);
+                else
+                    this.#attemptInterval.refresh();
+
+                this.#attemptSend();
+            }
+
+            this.#queue.push(GET_PIN_POWER, serialize({ type: "set-pin-power", id: pin, power }), callback);
+        }
     }
 
-    setPinPower(pin: number | string, power: number | boolean): Promise<void>
+    setPinMode(
+        pin: number | string,
+        mode: PinMode,
+        callback: (this: BeadInterface, error: "invalid-pin-id" | null) => void): void
     {
-        if (!(this instanceof BeadInterface))
-            throw new TypeError(
-                `'setPinPower' called on an object that does not implement interface BeadInterface.`);
-
-        return new Promise(async (resolve, reject) =>
+        if (typeof pin === "string")
         {
-            this.#setPinPowerResolves.push(resolve, reject);
-            const pinId = await this.idOfPin(pin);
-            this.#serialPort.write(serialize("set-pin-power", pinId, power));
-            this.emit("pin-power-set", pinId, power);
-        });
+            this.pinNameToId(pin, (error, pin) =>
+            {
+                if (error !== null)
+                    return Function.prototype.call.call(callback, "invalid-pin-id");
+
+                this.#queue.push(GET_PIN_MODE, serialize({ type: "set-pin-mode", id: pin, mode }), callback);
+            });
+        }
+        else
+        {
+            if (this.#queue.length === 0)
+            {
+                if (this.#attemptInterval === null)
+                    this.#attemptInterval = setInterval(this.#attemptSend, 500);
+                else
+                    this.#attemptInterval.refresh();
+
+                this.#attemptSend();
+            }
+
+            this.#queue.push(GET_PIN_MODE, serialize({ type: "set-pin-mode", id: pin, mode }), callback);
+        }
     }
 
-    setPinMode(pin: number | string, mode: PinMode): Promise<void>
+    close()
     {
-        if (!(this instanceof BeadInterface))
-            throw new TypeError(
-                `'setPinMode' called on an object that does not implement interface BeadInterface.`);
+        this.#queue.length = 0;
 
-        return new Promise(async (resolve, reject) =>
+        if (this.#attemptInterval !== null)
         {
-            this.#setPinModeResolves.push(resolve, reject);
-            const pinId = await this.idOfPin(pin);
-            this.#serialPort.write(serialize("set-pin-mode", pinId, mode));
-            this.emit("pin-mode-set", pinId, mode);
-        });
+            this.#attemptInterval.close();
+            this.#attemptInterval = null;
+        }
     }
 }
