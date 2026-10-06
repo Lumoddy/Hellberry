@@ -21,6 +21,14 @@ impl<T: Serialize> Serialize for &T
     }
 }
 
+impl<T: Serialize> Serialize for &mut T
+{
+    fn write_to(&self, writer: &mut impl Write) -> io::Result<()>
+    {
+        (**self).write_to(writer)
+    }
+}
+
 impl Serialize for Reset
 {
     fn write_to(&self, writer: &mut impl Write) -> io::Result<()>

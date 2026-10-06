@@ -87,318 +87,366 @@ impl Deserializer for DeserializerPacket
         {
             match self.state
             {
-                PacketId { ref mut de } => match ready!(de.resume(&bytes[total_bytes..]))
+                PacketId { ref mut de } =>
                 {
-                    (used_bytes, Break(Reset)) =>
+                    let (used_bytes, value) = ready!(de.resume(&bytes[total_bytes..]));
+
+                    total_bytes += used_bytes.get();
+                    let total_bytes = NonZero::new(total_bytes).unwrap();
+
+                    match value
                     {
-                        let used_bytes = NonZero::new(total_bytes + used_bytes.get()).unwrap();
-                        self.state = Done;
-                        return Poll::Ready((used_bytes, Break(Reset)));
-                    },
-                    (used_bytes, Continue(Ok(0))) =>
-                    {
-                        let used_bytes = NonZero::new(total_bytes + used_bytes.get()).unwrap();
-                        self.state = Done;
-                        return Poll::Ready((used_bytes, Continue(Ok(Packet::Pong))));
-                    },
-                    (used_bytes, Continue(Ok(1))) =>
-                    {
-                        total_bytes += used_bytes.get();
-                        self.state = Config { de: <_>::default() };
-                    },
-                    (used_bytes, Continue(Ok(2))) =>
-                    {
-                        total_bytes += used_bytes.get();
-                        self.state = GetPinPowerResponse { de: <_>::default() };
-                    },
-                    (used_bytes, Continue(Ok(3))) =>
-                    {
-                        total_bytes += used_bytes.get();
-                        self.state = GetPinModeResponse { de: <_>::default() };
-                    },
-                    (used_bytes, Continue(Ok(4))) =>
-                    {
-                        total_bytes += used_bytes.get();
-                        self.state = SetPinPowerResponse { de: <_>::default() };
-                    },
-                    (used_bytes, Continue(Ok(5))) =>
-                    {
-                        total_bytes += used_bytes.get();
-                        self.state = SetPinModeResponse { de: <_>::default() };
-                    },
-                    (used_bytes, Continue(Ok(6))) =>
-                    {
-                        total_bytes += used_bytes.get();
-                        self.state = PinListen { de: <_>::default() };
-                    },
-                    (used_bytes, Continue(Ok(101))) =>
-                    {
-                        total_bytes += used_bytes.get();
-                        self.state = InvalidPinMode { de: <_>::default() };
-                    },
-                    (used_bytes, Continue(Ok(102))) =>
-                    {
-                        total_bytes += used_bytes.get();
-                        self.state = InvalidPinId { de: <_>::default() };
-                    },
-                    (used_bytes, Continue(Ok(103))) =>
-                    {
-                        total_bytes += used_bytes.get();
-                        self.state = InvalidPacketId { de: <_>::default() };
-                    },
-                    (used_bytes, Continue(Ok(104))) =>
-                    {
-                        total_bytes += used_bytes.get();
-                        self.state = InvalidWriteToInput { de: <_>::default() };
-                    },
-                    (used_bytes, Continue(Ok(105))) =>
-                    {
-                        total_bytes += used_bytes.get();
-                        self.state = InvalidEscape { de: <_>::default() };
-                    },
-                    (used_bytes, Continue(Ok(byte))) =>
-                    {
-                        let used_bytes = NonZero::new(total_bytes + used_bytes.get()).unwrap();
-                        self.state = Done;
-                        return Poll::Ready((used_bytes, Continue(Err(Error::IncomingInvalidPacketId { byte }))));
-                    },
-                    (used_bytes, Continue(Err(error))) =>
-                    {
-                        let used_bytes = NonZero::new(total_bytes + used_bytes.get()).unwrap();
-                        self.state = Done;
-                        return Poll::Ready((used_bytes, Continue(Err(error.into()))));
-                    },
+                        Break(Reset) =>
+                        {
+                            self.state = Done;
+                            return Poll::Ready((total_bytes, Break(Reset)));
+                        },
+                        Continue(Ok(0)) =>
+                        {
+                            self.state = Done;
+                            return Poll::Ready((total_bytes, Continue(Ok(Packet::Pong))));
+                        },
+                        Continue(Ok(1)) =>
+                        {
+                            self.state = Config { de: <_>::default() };
+                        },
+                        Continue(Ok(2)) =>
+                        {
+                            self.state = GetPinPowerResponse { de: <_>::default() };
+                        },
+                        Continue(Ok(3)) =>
+                        {
+                            self.state = GetPinModeResponse { de: <_>::default() };
+                        },
+                        Continue(Ok(4)) =>
+                        {
+                            self.state = SetPinPowerResponse { de: <_>::default() };
+                        },
+                        Continue(Ok(5)) =>
+                        {
+                            self.state = SetPinModeResponse { de: <_>::default() };
+                        },
+                        Continue(Ok(6)) =>
+                        {
+                            self.state = PinListen { de: <_>::default() };
+                        },
+                        Continue(Ok(101)) =>
+                        {
+                            self.state = InvalidPinMode { de: <_>::default() };
+                        },
+                        Continue(Ok(102)) =>
+                        {
+                            self.state = InvalidPinId { de: <_>::default() };
+                        },
+                        Continue(Ok(103)) =>
+                        {
+                            self.state = InvalidPacketId { de: <_>::default() };
+                        },
+                        Continue(Ok(104)) =>
+                        {
+                            self.state = InvalidWriteToInput { de: <_>::default() };
+                        },
+                        Continue(Ok(105)) =>
+                        {
+                            self.state = InvalidEscape { de: <_>::default() };
+                        },
+                        Continue(Ok(byte)) =>
+                        {
+                            self.state = Done;
+                            return Poll::Ready((total_bytes, Continue(Err(Error::IncomingInvalidPacketId { byte }))));
+                        },
+                        Continue(Err(error)) =>
+                        {
+                            self.state = Done;
+                            return Poll::Ready((total_bytes, Continue(Err(error.into()))));
+                        },
+                    }
                 },
-                Config { ref mut de } => match ready!(de.resume(&bytes[total_bytes..]))
+                Config { ref mut de } => 
                 {
-                    (used_bytes, Break(Reset)) =>
+                    let (used_bytes, value) = ready!(de.resume(&bytes[total_bytes..]));
+
+                    total_bytes += used_bytes.get();
+                    let total_bytes = NonZero::new(total_bytes).unwrap();
+
+                    match value
                     {
-                        let used_bytes = NonZero::new(total_bytes + used_bytes.get()).unwrap();
-                        self.state = Done;
-                        return Poll::Ready((used_bytes, Break(Reset)));
-                    },
-                    (used_bytes, Continue(Ok(config))) =>
-                    {
-                        let used_bytes = NonZero::new(total_bytes + used_bytes.get()).unwrap();
-                        self.state = Done;
-                        return Poll::Ready((used_bytes, Continue(Ok(Packet::Config(config)))));
-                    },
-                    (used_bytes, Continue(Err(error))) =>
-                    {
-                        let used_bytes = NonZero::new(total_bytes + used_bytes.get()).unwrap();
-                        self.state = Done;
-                        return Poll::Ready((used_bytes, Continue(Err(error.into()))));
-                    },
+                        Break(Reset) =>
+                        {
+                            self.state = Done;
+                            return Poll::Ready((total_bytes, Break(Reset)));
+                        },
+                        Continue(Ok(config)) =>
+                        {
+                            self.state = Done;
+                            return Poll::Ready((total_bytes, Continue(Ok(Packet::Config(config)))));
+                        },
+                        Continue(Err(error)) =>
+                        {
+                            self.state = Done;
+                            return Poll::Ready((total_bytes, Continue(Err(error.into()))));
+                        },
+                    }
                 },
-                GetPinPowerResponse { ref mut de } => match ready!(de.resume(&bytes[total_bytes..]))
+                GetPinPowerResponse { ref mut de } =>
                 {
-                    (used_bytes, Break(Reset)) =>
+                    let (used_bytes, value) = ready!(de.resume(&bytes[total_bytes..]));
+
+                    total_bytes += used_bytes.get();
+                    let total_bytes = NonZero::new(total_bytes).unwrap();
+
+                    match value
                     {
-                        let used_bytes = NonZero::new(total_bytes + used_bytes.get()).unwrap();
-                        self.state = Done;
-                        return Poll::Ready((used_bytes, Break(Reset)));
-                    },
-                    (used_bytes, Continue(Ok((pin, power)))) =>
-                    {
-                        let used_bytes = NonZero::new(total_bytes + used_bytes.get()).unwrap();
-                        self.state = Done;
-                        return Poll::Ready((used_bytes, Continue(Ok(Packet::GetPinPowerResponse { pin, power }))));
-                    },
-                    (used_bytes, Continue(Err(error))) =>
-                    {
-                        let used_bytes = NonZero::new(total_bytes + used_bytes.get()).unwrap();
-                        self.state = Done;
-                        return Poll::Ready((used_bytes, Continue(Err(error.into()))));
-                    },
+                        Break(Reset) =>
+                        {
+                            self.state = Done;
+                            return Poll::Ready((total_bytes, Break(Reset)));
+                        },
+                        Continue(Ok((pin, power))) =>
+                        {
+                            self.state = Done;
+                            return Poll::Ready((total_bytes, Continue(Ok(Packet::GetPinPowerResponse { pin, power }))));
+                        },
+                        Continue(Err(error)) =>
+                        {
+                            self.state = Done;
+                            return Poll::Ready((total_bytes, Continue(Err(error.into()))));
+                        },
+                    }
                 },
-                GetPinModeResponse { ref mut de } => match ready!(de.resume(&bytes[total_bytes..]))
+                GetPinModeResponse { ref mut de } =>
                 {
-                    (used_bytes, Break(Reset)) =>
+                    let (used_bytes, value) = ready!(de.resume(&bytes[total_bytes..]));
+
+                    total_bytes += used_bytes.get();
+                    let total_bytes = NonZero::new(total_bytes).unwrap();
+
+                    match value
                     {
-                        let used_bytes = NonZero::new(total_bytes + used_bytes.get()).unwrap();
-                        self.state = Done;
-                        return Poll::Ready((used_bytes, Break(Reset)));
-                    },
-                    (used_bytes, Continue(Ok((pin, mode)))) =>
-                    {
-                        let used_bytes = NonZero::new(total_bytes + used_bytes.get()).unwrap();
-                        self.state = Done;
-                        return Poll::Ready((used_bytes, Continue(Ok(Packet::GetPinModeResponse { pin, mode }))));
-                    },
-                    (used_bytes, Continue(Err(error))) =>
-                    {
-                        let used_bytes = NonZero::new(total_bytes + used_bytes.get()).unwrap();
-                        self.state = Done;
-                        return Poll::Ready((used_bytes, Continue(Err(error.into()))));
-                    },
+                        Break(Reset) =>
+                        {
+                            self.state = Done;
+                            return Poll::Ready((total_bytes, Break(Reset)));
+                        },
+                        Continue(Ok((pin, mode))) =>
+                        {
+                            self.state = Done;
+                            return Poll::Ready((total_bytes, Continue(Ok(Packet::GetPinModeResponse { pin, mode }))));
+                        },
+                        Continue(Err(error)) =>
+                        {
+                            self.state = Done;
+                            return Poll::Ready((total_bytes, Continue(Err(error.into()))));
+                        },
+                    }
                 },
-                SetPinPowerResponse { ref mut de } => match ready!(de.resume(&bytes[total_bytes..]))
+                SetPinPowerResponse { ref mut de } =>
                 {
-                    (used_bytes, Break(Reset)) =>
+                    let (used_bytes, value) = ready!(de.resume(&bytes[total_bytes..]));
+
+                    total_bytes += used_bytes.get();
+                    let total_bytes = NonZero::new(total_bytes).unwrap();
+
+                    match value
                     {
-                        let used_bytes = NonZero::new(total_bytes + used_bytes.get()).unwrap();
-                        self.state = Done;
-                        return Poll::Ready((used_bytes, Break(Reset)));
-                    },
-                    (used_bytes, Continue(Ok((pin, power)))) =>
-                    {
-                        let used_bytes = NonZero::new(total_bytes + used_bytes.get()).unwrap();
-                        self.state = Done;
-                        return Poll::Ready((used_bytes, Continue(Ok(Packet::SetPinPowerResponse { pin, power }))));
-                    },
-                    (used_bytes, Continue(Err(error))) =>
-                    {
-                        let used_bytes = NonZero::new(total_bytes + used_bytes.get()).unwrap();
-                        self.state = Done;
-                        return Poll::Ready((used_bytes, Continue(Err(error.into()))));
-                    },
+                        Break(Reset) =>
+                        {
+                            self.state = Done;
+                            return Poll::Ready((total_bytes, Break(Reset)));
+                        },
+                        Continue(Ok((pin, power))) =>
+                        {
+                            self.state = Done;
+                            return Poll::Ready((total_bytes, Continue(Ok(Packet::SetPinPowerResponse { pin, power }))));
+                        },
+                        Continue(Err(error)) =>
+                        {
+                            self.state = Done;
+                            return Poll::Ready((total_bytes, Continue(Err(error.into()))));
+                        },
+                    }
                 },
-                SetPinModeResponse { ref mut de } => match ready!(de.resume(&bytes[total_bytes..]))
+                SetPinModeResponse { ref mut de } =>
                 {
-                    (used_bytes, Break(Reset)) =>
+                    let (used_bytes, value) = ready!(de.resume(&bytes[total_bytes..]));
+
+                    total_bytes += used_bytes.get();
+                    let total_bytes = NonZero::new(total_bytes).unwrap();
+
+                    match value
                     {
-                        let used_bytes = NonZero::new(total_bytes + used_bytes.get()).unwrap();
-                        self.state = Done;
-                        return Poll::Ready((used_bytes, Break(Reset)));
-                    },
-                    (used_bytes, Continue(Ok((pin, mode)))) =>
-                    {
-                        let used_bytes = NonZero::new(total_bytes + used_bytes.get()).unwrap();
-                        self.state = Done;
-                        return Poll::Ready((used_bytes, Continue(Ok(Packet::SetPinModeResponse { pin, mode }))));
-                    },
-                    (used_bytes, Continue(Err(error))) =>
-                    {
-                        let used_bytes = NonZero::new(total_bytes + used_bytes.get()).unwrap();
-                        self.state = Done;
-                        return Poll::Ready((used_bytes, Continue(Err(error.into()))));
-                    },
+                        Break(Reset) =>
+                        {
+                            self.state = Done;
+                            return Poll::Ready((total_bytes, Break(Reset)));
+                        },
+                        Continue(Ok((pin, mode))) =>
+                        {
+                            self.state = Done;
+                            return Poll::Ready((total_bytes, Continue(Ok(Packet::SetPinModeResponse { pin, mode }))));
+                        },
+                        Continue(Err(error)) =>
+                        {
+                            self.state = Done;
+                            return Poll::Ready((total_bytes, Continue(Err(error.into()))));
+                        },
+                    }
                 },
-                PinListen { ref mut de } => match ready!(de.resume(&bytes[total_bytes..]))
+                PinListen { ref mut de } =>
                 {
-                    (used_bytes, Break(Reset)) =>
+                    let (used_bytes, value) = ready!(de.resume(&bytes[total_bytes..]));
+
+                    total_bytes += used_bytes.get();
+                    let total_bytes = NonZero::new(total_bytes).unwrap();
+
+                    match value
                     {
-                        let used_bytes = NonZero::new(total_bytes + used_bytes.get()).unwrap();
-                        self.state = Done;
-                        return Poll::Ready((used_bytes, Break(Reset)));
-                    },
-                    (used_bytes, Continue(Ok((pin, power)))) =>
-                    {
-                        let used_bytes = NonZero::new(total_bytes + used_bytes.get()).unwrap();
-                        self.state = Done;
-                        return Poll::Ready((used_bytes, Continue(Ok(Packet::PinListen { pin, power }))));
-                    },
-                    (used_bytes, Continue(Err(error))) =>
-                    {
-                        let used_bytes = NonZero::new(total_bytes + used_bytes.get()).unwrap();
-                        self.state = Done;
-                        return Poll::Ready((used_bytes, Continue(Err(error.into()))));
-                    },
+                        Break(Reset) =>
+                        {
+                            self.state = Done;
+                            return Poll::Ready((total_bytes, Break(Reset)));
+                        },
+                        Continue(Ok((pin, power))) =>
+                        {
+                            self.state = Done;
+                            return Poll::Ready((total_bytes, Continue(Ok(Packet::PinListen { pin, power }))));
+                        },
+                        Continue(Err(error)) =>
+                        {
+                            self.state = Done;
+                            return Poll::Ready((total_bytes, Continue(Err(error.into()))));
+                        },
+                    }
                 },
-                InvalidPinMode { ref mut de } => match ready!(de.resume(&bytes[total_bytes..]))
+                InvalidPinMode { ref mut de } =>
                 {
-                    (used_bytes, Break(Reset)) =>
+                    let (used_bytes, value) = ready!(de.resume(&bytes[total_bytes..]));
+
+                    total_bytes += used_bytes.get();
+                    let total_bytes = NonZero::new(total_bytes).unwrap();
+
+                    match value
                     {
-                        let used_bytes = NonZero::new(total_bytes + used_bytes.get()).unwrap();
-                        self.state = Done;
-                        return Poll::Ready((used_bytes, Break(Reset)));
-                    },
-                    (used_bytes, Continue(Ok(byte))) =>
-                    {
-                        let used_bytes = NonZero::new(total_bytes + used_bytes.get()).unwrap();
-                        self.state = Done;
-                        return Poll::Ready((used_bytes, Continue(Err(Error::InvalidPinMode { byte }))));
-                    },
-                    (used_bytes, Continue(Err(error))) =>
-                    {
-                        let used_bytes = NonZero::new(total_bytes + used_bytes.get()).unwrap();
-                        self.state = Done;
-                        return Poll::Ready((used_bytes, Continue(Err(error.into()))));
-                    },
+                        Break(Reset) =>
+                        {
+                            self.state = Done;
+                            return Poll::Ready((total_bytes, Break(Reset)));
+                        },
+                        Continue(Ok(byte)) =>
+                        {
+                            self.state = Done;
+                            return Poll::Ready((total_bytes, Continue(Err(Error::InvalidPinMode { byte }))));
+                        },
+                        Continue(Err(error)) =>
+                        {
+                            self.state = Done;
+                            return Poll::Ready((total_bytes, Continue(Err(error.into()))));
+                        },
+                    }
                 },
-                InvalidPinId { ref mut de } => match ready!(de.resume(&bytes[total_bytes..]))
+                InvalidPinId { ref mut de } =>
                 {
-                    (used_bytes, Break(Reset)) =>
+                    let (used_bytes, value) = ready!(de.resume(&bytes[total_bytes..]));
+
+                    total_bytes += used_bytes.get();
+                    let total_bytes = NonZero::new(total_bytes).unwrap();
+
+                    match value
                     {
-                        let used_bytes = NonZero::new(total_bytes + used_bytes.get()).unwrap();
-                        self.state = Done;
-                        return Poll::Ready((used_bytes, Break(Reset)));
-                    },
-                    (used_bytes, Continue(Ok(byte))) =>
-                    {
-                        let used_bytes = NonZero::new(total_bytes + used_bytes.get()).unwrap();
-                        self.state = Done;
-                        return Poll::Ready((used_bytes, Continue(Err(Error::InvalidPinId { byte }))));
-                    },
-                    (used_bytes, Continue(Err(error))) =>
-                    {
-                        let used_bytes = NonZero::new(total_bytes + used_bytes.get()).unwrap();
-                        self.state = Done;
-                        return Poll::Ready((used_bytes, Continue(Err(error.into()))));
-                    },
+                        Break(Reset) =>
+                        {
+                            self.state = Done;
+                            return Poll::Ready((total_bytes, Break(Reset)));
+                        },
+                        Continue(Ok(byte)) =>
+                        {
+                            self.state = Done;
+                            return Poll::Ready((total_bytes, Continue(Err(Error::InvalidPinId { byte }))));
+                        },
+                        Continue(Err(error)) =>
+                        {
+                            self.state = Done;
+                            return Poll::Ready((total_bytes, Continue(Err(error.into()))));
+                        },
+                    }
                 },
-                InvalidPacketId { ref mut de } => match ready!(de.resume(&bytes[total_bytes..]))
+                InvalidPacketId { ref mut de } =>
                 {
-                    (used_bytes, Break(Reset)) =>
+                    let (used_bytes, value) = ready!(de.resume(&bytes[total_bytes..]));
+
+                    total_bytes += used_bytes.get();
+                    let total_bytes = NonZero::new(total_bytes).unwrap();
+
+                    match value
                     {
-                        let used_bytes = NonZero::new(total_bytes + used_bytes.get()).unwrap();
-                        self.state = Done;
-                        return Poll::Ready((used_bytes, Break(Reset)));
-                    },
-                    (used_bytes, Continue(Ok(byte))) =>
-                    {
-                        let used_bytes = NonZero::new(total_bytes + used_bytes.get()).unwrap();
-                        self.state = Done;
-                        return Poll::Ready((used_bytes, Continue(Err(Error::InvalidPacketId { byte }))));
-                    },
-                    (used_bytes, Continue(Err(error))) =>
-                    {
-                        let used_bytes = NonZero::new(total_bytes + used_bytes.get()).unwrap();
-                        self.state = Done;
-                        return Poll::Ready((used_bytes, Continue(Err(error.into()))));
-                    },
+                        Break(Reset) =>
+                        {
+                            self.state = Done;
+                            return Poll::Ready((total_bytes, Break(Reset)));
+                        },
+                        Continue(Ok(byte)) =>
+                        {
+                            self.state = Done;
+                            return Poll::Ready((total_bytes, Continue(Err(Error::InvalidPacketId { byte }))));
+                        },
+                        Continue(Err(error)) =>
+                        {
+                            self.state = Done;
+                            return Poll::Ready((total_bytes, Continue(Err(error.into()))));
+                        },
+                    }
                 },
-                InvalidWriteToInput { ref mut de } => match ready!(de.resume(&bytes[total_bytes..]))
+                InvalidWriteToInput { ref mut de } =>
                 {
-                    (used_bytes, Break(Reset)) =>
+                    let (used_bytes, value) = ready!(de.resume(&bytes[total_bytes..]));
+
+                    total_bytes += used_bytes.get();
+                    let total_bytes = NonZero::new(total_bytes).unwrap();
+
+                    match value
                     {
-                        let used_bytes = NonZero::new(total_bytes + used_bytes.get()).unwrap();
-                        self.state = Done;
-                        return Poll::Ready((used_bytes, Break(Reset)));
-                    },
-                    (used_bytes, Continue(Ok((pin, power)))) =>
-                    {
-                        let used_bytes = NonZero::new(total_bytes + used_bytes.get()).unwrap();
-                        self.state = Done;
-                        return Poll::Ready((used_bytes, Continue(Err(Error::InvalidWriteToInput { pin, power }))));
-                    },
-                    (used_bytes, Continue(Err(error))) =>
-                    {
-                        let used_bytes = NonZero::new(total_bytes + used_bytes.get()).unwrap();
-                        self.state = Done;
-                        return Poll::Ready((used_bytes, Continue(Err(error.into()))));
-                    },
+                        Break(Reset) =>
+                        {
+                            self.state = Done;
+                            return Poll::Ready((total_bytes, Break(Reset)));
+                        },
+                        Continue(Ok((pin, power))) =>
+                        {
+                            self.state = Done;
+                            return Poll::Ready((total_bytes, Continue(Err(Error::InvalidWriteToInput { pin, power }))));
+                        },
+                        Continue(Err(error)) =>
+                        {
+                            self.state = Done;
+                            return Poll::Ready((total_bytes, Continue(Err(error.into()))));
+                        },
+                    }
                 },
-                InvalidEscape { ref mut de } => match ready!(de.resume(&bytes[total_bytes..]))
+                InvalidEscape { ref mut de } =>
                 {
-                    (used_bytes, Break(Reset)) =>
+                    let (used_bytes, value) = ready!(de.resume(&bytes[total_bytes..]));
+
+                    total_bytes += used_bytes.get();
+                    let total_bytes = NonZero::new(total_bytes).unwrap();
+
+                    match value
                     {
-                        let used_bytes = NonZero::new(total_bytes + used_bytes.get()).unwrap();
-                        self.state = Done;
-                        return Poll::Ready((used_bytes, Break(Reset)));
-                    },
-                    (used_bytes, Continue(Ok(byte))) =>
-                    {
-                        let used_bytes = NonZero::new(total_bytes + used_bytes.get()).unwrap();
-                        self.state = Done;
-                        return Poll::Ready((used_bytes, Continue(Err(Error::InvalidEscape { byte }))));
-                    },
-                    (used_bytes, Continue(Err(error))) =>
-                    {
-                        let used_bytes = NonZero::new(total_bytes + used_bytes.get()).unwrap();
-                        self.state = Done;
-                        return Poll::Ready((used_bytes, Continue(Err(error.into()))));
-                    },
+                        Break(Reset) =>
+                        {
+                            self.state = Done;
+                            return Poll::Ready((total_bytes, Break(Reset)));
+                        },
+                        Continue(Ok(byte)) =>
+                        {
+                            self.state = Done;
+                            return Poll::Ready((total_bytes, Continue(Err(Error::InvalidEscape { byte }))));
+                        },
+                        Continue(Err(error)) =>
+                        {
+                            self.state = Done;
+                            return Poll::Ready((total_bytes, Continue(Err(error.into()))));
+                        },
+                    }
                 },
                 Done =>
                 {

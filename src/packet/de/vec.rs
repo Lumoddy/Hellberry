@@ -105,63 +105,72 @@ where
         {
             match self.state
             {
-                Len { ref mut de } => match ready!(de.resume(&bytes[total_bytes..]))
+                Len { ref mut de } =>
                 {
-                    (used_bytes, Break(Reset)) =>
-                    {
-                        let used_bytes = NonZero::new(total_bytes + used_bytes.get()).unwrap();
-                        self.state = Done;
-                        return Poll::Ready((used_bytes, Break(Reset)));
-                    },
-                    (used_bytes, Continue(Ok(0))) =>
-                    {
-                        let used_bytes = NonZero::new(total_bytes + used_bytes.get()).unwrap();
-                        self.state = Done;
-                        return Poll::Ready((used_bytes, Continue(Ok(Vec::new()))));
-                    },
-                    (used_bytes, Continue(Ok(len))) =>
-                    {
-                        total_bytes += used_bytes.get();
-                        self.state = Element
-                        {
-                            buffer: Vec::with_capacity(len as usize),
-                            len,
-                            de: <_>::default(),
-                        };
-                    },
-                    (used_bytes, Continue(Err(error))) =>
-                    {
-                        let used_bytes = NonZero::new(total_bytes + used_bytes.get()).unwrap();
-                        self.state = Done;
-                        return Poll::Ready((used_bytes, Continue(Err(error.into()))));
-                    },
-                },
-                Element { ref mut buffer, len, ref mut de } => match ready!(de.resume(&bytes[total_bytes..]))
-                {
-                    (used_bytes, Break(Reset)) =>
-                    {
-                        let used_bytes = NonZero::new(total_bytes + used_bytes.get()).unwrap();
-                        self.state = Done;
-                        return Poll::Ready((used_bytes, Break(Reset)));
-                    },
-                    (used_bytes, Continue(Ok(item))) =>
-                    {
-                        total_bytes += used_bytes.get();
-                        buffer.push(item);
+                    let (used_bytes, value) = ready!(de.resume(&bytes[total_bytes..]));
 
-                        if buffer.len() == len as usize
-                        {
-                            let buffer = mem::take(buffer);
-                            self.state = Done;
-                            return Poll::Ready((used_bytes, Continue(Ok(buffer))));
-                        }
-                    },
-                    (used_bytes, Continue(Err(error))) =>
+                    total_bytes += used_bytes.get();
+                    let total_bytes = NonZero::new(total_bytes).unwrap();
+
+                    match value
                     {
-                        let used_bytes = NonZero::new(total_bytes + used_bytes.get()).unwrap();
-                        self.state = Done;
-                        return Poll::Ready((used_bytes, Continue(Err(error.into()))));
-                    },
+                        Break(Reset) =>
+                        {
+                            self.state = Done;
+                            return Poll::Ready((total_bytes, Break(Reset)));
+                        },
+                        Continue(Ok(0)) =>
+                        {
+                            self.state = Done;
+                            return Poll::Ready((total_bytes, Continue(Ok(Vec::new()))));
+                        },
+                        Continue(Ok(len)) =>
+                        {
+                            self.state = Element
+                            {
+                                buffer: Vec::with_capacity(len as usize),
+                                len,
+                                de: <_>::default(),
+                            };
+                        },
+                        Continue(Err(error)) =>
+                        {
+                            self.state = Done;
+                            return Poll::Ready((total_bytes, Continue(Err(error.into()))));
+                        },
+                    }
+                },
+                Element { ref mut buffer, len, ref mut de } =>
+                {
+                    let (used_bytes, value) = ready!(de.resume(&bytes[total_bytes..]));
+
+                    total_bytes += used_bytes.get();
+                    let total_bytes = NonZero::new(total_bytes).unwrap();
+
+                    match value
+                    {
+                        Break(Reset) =>
+                        {
+                            self.state = Done;
+                            return Poll::Ready((total_bytes, Break(Reset)));
+                        },
+                        Continue(Ok(item)) =>
+                        {
+                            buffer.push(item);
+
+                            if buffer.len() == len as usize
+                            {
+                                let buffer = mem::take(buffer);
+                                self.state = Done;
+                                return Poll::Ready((total_bytes, Continue(Ok(buffer))));
+                            }
+                        },
+                        Continue(Err(error)) =>
+                        {
+                            self.state = Done;
+                            return Poll::Ready((total_bytes, Continue(Err(error.into()))));
+                        },
+                    }
                 },
                 Done =>
                 {

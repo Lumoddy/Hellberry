@@ -1,9 +1,10 @@
-use std::mem;
+use std::io::Write;
+use std::{io, mem};
 use std::num::NonZero;
 use std::ops::ControlFlow;
 use std::task::{Poll, ready};
 
-use crate::packet::{Deserializer, DeserializerU8, DeserializerU16, DeserializerVec, InvalidEscape, Reset};
+use crate::packet::{Deserializer, DeserializerU8, DeserializerU16, DeserializerVec, InvalidEscape, Reset, Serialize};
 
 use ControlFlow::*;
 use packet::incoming;
@@ -55,6 +56,14 @@ impl PinFlags
     {
         self.0 = (self.0 & !8) | if value { 8 } else { 0 };
         self
+    }
+}
+
+impl Serialize for PinFlags
+{
+    fn write_to(&self, writer: &mut impl Write) -> io::Result<()>
+    {
+        self.0.write_to(writer)
     }
 }
 
@@ -125,6 +134,21 @@ impl TryFrom<u8> for PinMode
     }
 }
 
+impl Serialize for PinMode
+{
+    fn write_to(&self, writer: &mut impl Write) -> io::Result<()>
+    {
+        match self
+        {
+            Self::DigitalInput => 0u8.write_to(writer),
+            Self::DigitalListen => 1u8.write_to(writer),
+            Self::DigitalOutput => 2u8.write_to(writer),
+            Self::AnalogInput => 3u8.write_to(writer),
+            Self::AnalogOutput => 4u8.write_to(writer),
+        }
+    }
+}
+
 #[derive(Clone, Debug, Default)]
 pub struct DeserializerPinMode
 {
@@ -158,6 +182,15 @@ pub struct ConfigPin
 {
     name: Vec<u8>,
     flags: PinFlags,
+}
+
+impl Serialize for ConfigPin
+{
+    fn write_to(&self, writer: &mut impl Write) -> io::Result<()>
+    {
+        self.name.write_to(writer)?;
+        self.flags.write_to(writer)
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -254,6 +287,16 @@ pub struct Config
     version: u16,
     name: Vec<u8>,
     pins: Vec<ConfigPin>,
+}
+
+impl Serialize for Config
+{
+    fn write_to(&self, writer: &mut impl Write) -> io::Result<()>
+    {
+        self.version.write_to(writer)?;
+        self.name.write_to(writer)?;
+        self.pins.write_to(writer)
+    }
 }
 
 #[derive(Clone, Debug)]

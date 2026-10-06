@@ -14,6 +14,8 @@ use std::task::Poll;
 
 use super::Reset;
 
+use ControlFlow::*;
+
 pub trait Deserializer
 {
     type Output;
@@ -22,6 +24,20 @@ pub trait Deserializer
 
     fn resume(&mut self, bytes: &[u8]) -> Poll<(NonZero<usize>, ControlFlow<Reset, Result<Self::Output, Self::Error>>)>;
 }
+
+impl<T: ?Sized + Deserializer> Deserializer for &mut T
+{
+    type Output = T::Output;
+
+    type Error = T::Error;
+
+    fn resume(&mut self, bytes: &[u8]) -> Poll<(NonZero<usize>, ControlFlow<Reset, Result<Self::Output, Self::Error>>)>
+    {
+        (**self).resume(bytes)
+    }
+}
+
+
 
 #[derive(Clone, Copy, Debug, Default, Hash, PartialEq, Eq, PartialOrd, Ord)]
 pub struct InvalidEscape { pub byte: u8 }

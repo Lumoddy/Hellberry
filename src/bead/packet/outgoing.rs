@@ -15,21 +15,6 @@ pub enum Packet
     SetPinMode { pin: u8, mode: PinMode },
 }
 
-impl Serialize for PinMode
-{
-    fn write_to(&self, writer: &mut impl Write) -> io::Result<()>
-    {
-        match self
-        {
-            Self::DigitalInput => 0u8.write_to(writer),
-            Self::DigitalListen => 1u8.write_to(writer),
-            Self::DigitalOutput => 2u8.write_to(writer),
-            Self::AnalogInput => 3u8.write_to(writer),
-            Self::AnalogOutput => 4u8.write_to(writer),
-        }
-    }
-}
-
 impl Serialize for Packet
 {
     fn write_to(&self, writer: &mut impl Write) -> io::Result<()>
