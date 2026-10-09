@@ -4,15 +4,53 @@ use std::num::NonZero;
 use std::ops::ControlFlow;
 use std::task::{Poll, ready};
 
-use crate::packet::{Deserializer, DeserializerU8, DeserializerU16, DeserializerVec, InvalidEscape, Reset, Serialize};
+use crate::packet::{Deserializer, DeserializerString, DeserializerU8, DeserializerU16, DeserializerVec, InvalidEscape, Reset, Serialize};
 
 use ControlFlow::*;
 use packet::incoming;
+use serde::ser::SerializeStruct;
 
 pub mod packet;
 
 #[derive(Clone, Copy, Debug, Default, Hash, PartialEq, Eq)]
 pub struct PinFlags(u8);
+
+impl PinFlags
+{
+    pub const fn new() -> Self { Self(0) }
+
+    pub const fn digital_input(&self) -> bool { (self.0 & 1) != 0 }
+
+    pub const fn set_digital_input(&mut self, value: bool) -> &mut Self
+    {
+        self.0 = (self.0 & !1) | if value { 1 } else { 0 };
+        self
+    }
+
+    pub const fn digital_output(&self) -> bool { (self.0 & 2) != 0 }
+
+    pub const fn set_digital_output(&mut self, value: bool) -> &mut Self
+    {
+        self.0 = (self.0 & !2) | if value { 2 } else { 0 };
+        self
+    }
+
+    pub const fn analog_input(&self) -> bool { (self.0 & 4) != 0 }
+
+    pub const fn set_analog_input(&mut self, value: bool) -> &mut Self
+    {
+        self.0 = (self.0 & !4) | if value { 4 } else { 0 };
+        self
+    }
+
+    pub const fn analog_output(&self) -> bool { (self.0 & 8) != 0 }
+
+    pub const fn set_analog_output(&mut self, value: bool) -> &mut Self
+    {
+        self.0 = (self.0 & !8) | if value { 8 } else { 0 };
+        self
+    }
+}
 
 impl From<u8> for PinFlags
 {
@@ -24,46 +62,65 @@ impl From<PinFlags> for u8
     fn from(value: PinFlags) -> Self { value.0 }
 }
 
-impl PinFlags
-{
-    const fn digital_input(&self) -> bool { (self.0 & 1) != 0 }
-
-    const fn set_digital_input(&mut self, value: bool) -> &mut Self
-    {
-        self.0 = (self.0 & !1) | if value { 1 } else { 0 };
-        self
-    }
-
-    const fn digital_output(&self) -> bool { (self.0 & 2) != 0 }
-
-    const fn set_digital_output(&mut self, value: bool) -> &mut Self
-    {
-        self.0 = (self.0 & !2) | if value { 2 } else { 0 };
-        self
-    }
-
-    const fn analog_input(&self) -> bool { (self.0 & 4) != 0 }
-
-    const fn set_analog_input(&mut self, value: bool) -> &mut Self
-    {
-        self.0 = (self.0 & !4) | if value { 4 } else { 0 };
-        self
-    }
-
-    const fn analog_output(&self) -> bool { (self.0 & 8) != 0 }
-
-    const fn set_analog_output(&mut self, value: bool) -> &mut Self
-    {
-        self.0 = (self.0 & !8) | if value { 8 } else { 0 };
-        self
-    }
-}
-
 impl Serialize for PinFlags
 {
     fn write_to(&self, writer: &mut impl Write) -> io::Result<()>
     {
         self.0.write_to(writer)
+    }
+}
+
+impl serde::Serialize for PinFlags
+{
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer
+    {
+        if !serializer.is_human_readable()
+        {
+            return serializer.serialize_u8(self.0)
+        }
+
+        let mut serializer = serializer.serialize_struct("PinFlags", 4)?;
+        serializer.serialize_field("digital-input", &self.digital_input())?;
+        serializer.serialize_field("digital-output", &self.digital_output())?;
+        serializer.serialize_field("analog-input", &self.analog_input())?;
+        serializer.serialize_field("analog-output", &self.analog_output())?;
+        serializer.end()
+    }
+}
+
+impl<'de> serde::Deserialize<'de> for PinFlags
+{
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>
+    {
+        if !deserializer.is_human_readable()
+        {
+            return Ok(Self(u8::deserialize(deserializer)?))
+        }
+
+        #[derive(serde::Deserialize)]
+        struct PinFlagsHelper
+        {
+            #[serde(rename = "digital-input")]
+            digital_input: bool,
+            #[serde(rename = "digital-output")]
+            digital_output: bool,
+            #[serde(rename = "analog-input")]
+            analog_input: bool,
+            #[serde(rename = "analog-output")]
+            analog_output: bool,
+        }
+
+        let helper = PinFlagsHelper::deserialize(deserializer)?;
+        let mut flags = Self::default();
+        flags.set_digital_input(helper.digital_input);
+        flags.set_digital_output(helper.digital_output);
+        flags.set_analog_input(helper.analog_input);
+        flags.set_analog_output(helper.analog_output);
+        Ok(flags)
     }
 }
 
@@ -91,7 +148,8 @@ impl Deserializer for DeserializerPinFlags
     }
 }
 
-#[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, serde::Deserialize, serde::Serialize, Hash, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
 pub enum PinMode
 {
     DigitalInput,
@@ -177,10 +235,11 @@ impl Deserializer for DeserializerPinMode
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, serde::Deserialize, serde::Serialize, PartialEq, Eq)]
+
 pub struct ConfigPin
 {
-    name: Vec<u8>,
+    name: String,
     flags: PinFlags,
 }
 
@@ -196,8 +255,8 @@ impl Serialize for ConfigPin
 #[derive(Clone, Debug)]
 enum DeserializerConfigPinState
 {
-    Name { de: DeserializerVec<DeserializerU8> },
-    Flag { name: Vec<u8>, de: DeserializerPinFlags },
+    Name { de: DeserializerString },
+    Flag { name: String, de: DeserializerPinFlags },
     Done,
 }
 
@@ -235,7 +294,7 @@ impl Deserializer for DeserializerConfigPin
                         (bytes_used, Continue(Ok(name))) =>
                         {
                             total_bytes += bytes_used.get();
-                            self.state = Flag { name, de: DeserializerPinFlags::default() };
+                            self.state = Flag { name, de: <_>::default() };
                         },
                         (bytes_used, Continue(Err(error))) =>
                         {
@@ -285,7 +344,7 @@ impl Deserializer for DeserializerConfigPin
 pub struct Config
 {
     version: u16,
-    name: Vec<u8>,
+    name: String,
     pins: Vec<ConfigPin>,
 }
 
@@ -303,8 +362,8 @@ impl Serialize for Config
 enum DeserializerConfigState
 {
     Version { de: DeserializerU16 },
-    Name { version: u16, de: DeserializerVec<DeserializerU8> },
-    Pins { version: u16, name: Vec<u8>, de: DeserializerVec<DeserializerConfigPin> },
+    Name { version: u16, de: DeserializerString },
+    Pins { version: u16, name: String, de: DeserializerVec<DeserializerConfigPin> },
     Done,
 }
 
@@ -342,7 +401,7 @@ impl Deserializer for DeserializerConfig
                         (bytes_used, Continue(Ok(version))) =>
                         {
                             total_bytes += bytes_used.get();
-                            self.state = Name { version, de: DeserializerVec::default() };
+                            self.state = Name { version, de: <_>::default() };
                         },
                         (bytes_used, Continue(Err(error))) =>
                         {

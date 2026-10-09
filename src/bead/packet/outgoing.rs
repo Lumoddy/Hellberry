@@ -23,10 +23,10 @@ impl Serialize for Packet
         {
             Self::Ping => (0u8,).write_to(writer),
             Self::WholeConfig => (1u8,).write_to(writer),
-            Self::GetPinPower { pin } => (2u8, *pin).write_to(writer),
-            Self::GetPinMode { pin } => (3u8, *pin).write_to(writer),
-            Self::SetPinPower { pin, power } => (4u8, *pin, *power).write_to(writer),
-            Self::SetPinMode { pin, mode } => (5u8, *pin, *mode).write_to(writer),
+            Self::GetPinPower { pin } => (2u8, pin).write_to(writer),
+            Self::GetPinMode { pin } => (3u8, pin).write_to(writer),
+            Self::SetPinPower { pin, power } => (4u8, pin, power).write_to(writer),
+            Self::SetPinMode { pin, mode } => (5u8, pin, mode).write_to(writer),
         }
     }
 }

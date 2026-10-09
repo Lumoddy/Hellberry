@@ -4,7 +4,7 @@ use std::num::NonZero;
 use std::ops::ControlFlow;
 use std::task::{Poll, ready};
 
-use super::{Deserializer, DeserializerU16, InvalidEscape, Reset};
+use super::{Deserializer, DeserializerU8, DeserializerU16, InvalidEscape, InvalidEscapeOrUft8, Reset};
 
 use ControlFlow::*;
 
@@ -177,6 +177,31 @@ where
                     panic!("cannot resume completed deserializer");
                 },
             }
+        }
+    }
+}
+
+#[derive(Clone, Default, Debug)]
+pub struct DeserializerString
+{
+    inner: DeserializerVec<DeserializerU8>,
+}
+
+impl Deserializer for DeserializerString
+{
+    type Output = String;
+
+    type Error = InvalidEscapeOrUft8;
+
+    fn resume(&mut self, bytes: &[u8]) -> Poll<(NonZero<usize>, ControlFlow<Reset, Result<Self::Output, Self::Error>>)>
+    {
+        let (used_bytes, value) = ready!(self.inner.resume(bytes));
+
+        match value
+        {
+            Break(Reset) => Poll::Ready((used_bytes, Break(Reset))),
+            Continue(Ok(x)) => Poll::Ready((used_bytes, Continue(String::from_utf8(x).map_err(|_| InvalidEscapeOrUft8::Utf8Error)))),
+            Continue(Err(error)) => Poll::Ready((used_bytes, Continue(Err(error.into())))),
         }
     }
 }

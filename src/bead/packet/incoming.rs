@@ -3,7 +3,7 @@ use std::ops::ControlFlow;
 use std::task::{Poll, ready};
 
 use crate::bead::{Config, DeserializerConfig, DeserializerPinMode, PinMode};
-use crate::packet::{Deserializer, DeserializerPair, DeserializerU8, DeserializerU16, InvalidEscape, Reset};
+use crate::packet::{Deserializer, DeserializerPair, DeserializerU8, DeserializerU16, InvalidEscape, InvalidEscapeOrUft8, Reset};
 
 use ControlFlow::*;
 
@@ -39,6 +39,18 @@ impl From<InvalidEscape> for Error
     fn from(value: InvalidEscape) -> Self
     {
         Self::IncomingInvalidEscape { byte: value.byte }
+    }
+}
+
+impl From<InvalidEscapeOrUft8> for Error
+{
+    fn from(value: InvalidEscapeOrUft8) -> Self
+    {
+        match value
+        {
+            InvalidEscapeOrUft8::InvalidEscape(x) => Self::IncomingInvalidEscape { byte: x.byte },
+            InvalidEscapeOrUft8::Utf8Error => Self::IncomingInvalidUTF8,
+        }
     }
 }
 

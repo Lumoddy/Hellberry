@@ -27,7 +27,7 @@ pub struct Configuration
     pub broadcast_port: Option<u16>,
 }
 
-pub async fn poll_config() -> Option<Configuration>
+pub async fn read_config() -> Option<Configuration>
 {
     static PATH_JSON: OnceCell<PathBuf> = OnceCell::const_new();
 
@@ -106,7 +106,8 @@ pub async fn poll_config() -> Option<Configuration>
             match serde_yaml::from_slice(&file)
             {
                 Ok(x) => return Some(x),
-                Err(error) => eprintln!("{Warn}: Failed to read configuration file: {}.", error),
+                Err(error) =>
+                eprintln!("{Warn}: Failed to read configuration file: {}.", error),
             }
         }
         Err(error) =>

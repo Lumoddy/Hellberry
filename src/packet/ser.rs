@@ -73,11 +73,27 @@ impl<T: Serialize> Serialize for [T]
     }
 }
 
+impl<T: Serialize> Serialize for Vec<T>
+{
+    fn write_to(&self, writer: &mut impl Write) -> io::Result<()>
+    {
+        self.as_slice().write_to(writer)
+    }
+}
+
 impl Serialize for str
 {
     fn write_to(&self, writer: &mut impl Write) -> io::Result<()>
     {
         self.as_bytes().write_to(writer)
+    }
+}
+
+impl Serialize for String
+{
+    fn write_to(&self, writer: &mut impl Write) -> io::Result<()>
+    {
+        self.as_str().write_to(writer)
     }
 }
 

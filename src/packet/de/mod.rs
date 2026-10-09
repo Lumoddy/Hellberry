@@ -37,7 +37,17 @@ impl<T: ?Sized + Deserializer> Deserializer for &mut T
     }
 }
 
-
-
 #[derive(Clone, Copy, Debug, Default, Hash, PartialEq, Eq, PartialOrd, Ord)]
 pub struct InvalidEscape { pub byte: u8 }
+
+#[derive(Clone, Copy, Debug, Hash, PartialEq, Eq, PartialOrd, Ord)]
+pub enum InvalidEscapeOrUft8
+{
+    InvalidEscape(InvalidEscape),
+    Utf8Error,
+}
+
+impl From<InvalidEscape> for InvalidEscapeOrUft8
+{
+    fn from(value: InvalidEscape) -> Self { Self::InvalidEscape(value) }
+}
