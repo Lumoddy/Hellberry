@@ -169,7 +169,7 @@ async fn main()
 
             tokio::spawn(async move
             {
-                let mut broadcast_interval = tokio::time::interval(Duration::from_secs_f32(1.0));
+                let mut interval = tokio::time::interval(Duration::from_secs_f32(1.0));
                 let message = format!("[Hellberry:{}]", local_ip);
 
                 loop
@@ -177,7 +177,7 @@ async fn main()
                     select!
                     {
                         _ = shutdown_signal() => break,
-                        _ = broadcast_interval.tick() => (),
+                        _ = interval.tick() => (),
                     }
 
                     broadcaster.send(message.as_bytes()).await.unwrap();

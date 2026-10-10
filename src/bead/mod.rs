@@ -6,11 +6,14 @@ use std::task::{Poll, ready};
 
 use crate::packet::{Deserializer, DeserializerString, DeserializerU8, DeserializerU16, DeserializerVec, InvalidEscape, Reset, Serialize};
 
-use ControlFlow::*;
 use packet::incoming;
 use serde::ser::SerializeStruct;
 
 pub mod packet;
+
+pub mod serial_handler;
+
+use ControlFlow::*;
 
 #[derive(Clone, Copy, Debug, Default, Hash, PartialEq, Eq)]
 pub struct PinFlags(u8);

@@ -14,8 +14,8 @@ pub fn media_type_of_bytes(path: &[u8]) -> &'static str
     match path
     {
         x if x.ends_with(b".png") || x.ends_with(b".PNG") => "image/png",
-        x if x.ends_with(b".jpg") || x.ends_with(b".jpeg")
-            || x.ends_with(b".JPG") || x.ends_with(b".JPEG") => "image/jpeg",
+        x if x.ends_with(b".jpg") || x.ends_with(b".JPG")
+            || x.ends_with(b".jpeg") || x.ends_with(b".JPEG") => "image/jpeg",
         x if x.ends_with(b".webp") || x.ends_with(b".WEBP") => "image/webp",
         x if x.ends_with(b".svg") || x.ends_with(b".SVG") => "image/svg+xml",
         _ => "application/octet-stream",
@@ -91,10 +91,10 @@ pub fn router() -> Router
             {
                 Ping,
                 WholeConfig,
-                GetBeadPinPower { pin: u8, power: u16 },
-                GetBeadPinMode { pin: u8, mode: PinMode },
-                SetBeadPinPower { pin: u8, power: u16 },
-                SetBeadPinMode { pin: u8, mode: PinMode },
+                GetBeadPinPower { bead_name: String, pin_name: String, power: u16 },
+                GetBeadPinMode { bead_name: String, pin_name: String, mode: PinMode },
+                SetBeadPinPower { bead_name: String, pin_name: String, power: u16 },
+                SetBeadPinMode { bead_name: String, pin_name: String, mode: PinMode },
             }
 
             #[derive(Clone, Debug, serde::Serialize, PartialEq, Eq)]
@@ -107,11 +107,11 @@ pub fn router() -> Router
                     #[serde(skip_serializing_if = "Option::is_none")]
                     name: Option<String>,
                 },
-                GetBeadPinPowerResponse { pin: u8, power: u16 },
-                GetBeadPinModeResponse { pin: u8, mode: PinMode },
-                SetBeadPinPowerResponse { pin: u8, power: u16 },
-                SetBeadPinModeResponse { pin: u8, mode: PinMode },
-                BeadPinListen { pin: u8, power: u16 },
+                GetBeadPinPowerResponse { bead_name: String, pin_name: String, power: u16 },
+                GetBeadPinModeResponse { bead_name: String, pin_name: String, mode: PinMode },
+                SetBeadPinPowerResponse { bead_name: String, pin_name: String, power: u16 },
+                SetBeadPinModeResponse { bead_name: String, pin_name: String, mode: PinMode },
+                BeadPinListen { bead_name: String, pin_name: String, power: u16 },
                 InvalidBeadPinName { pin_name: String },
                 InvalidWriteToInput { pin_name: String, power: u16 },
                 InvalidUnsupportedMode { pin_name: String, mode: PinMode },
@@ -148,19 +148,19 @@ pub fn router() -> Router
                             break;
                         }
                     },
-                    Ok(Incoming::GetBeadPinPower { pin, power }) =>
+                    Ok(Incoming::GetBeadPinPower { bead_name, pin_name, power }) =>
                     {
                         todo!()
                     },
-                    Ok(Incoming::GetBeadPinMode { pin, mode }) =>
+                    Ok(Incoming::GetBeadPinMode { bead_name, pin_name, mode }) =>
                     {
                         todo!()
                     },
-                    Ok(Incoming::SetBeadPinPower { pin, power }) =>
+                    Ok(Incoming::SetBeadPinPower { bead_name, pin_name, power }) =>
                     {
                         todo!()
                     },
-                    Ok(Incoming::SetBeadPinMode { pin, mode }) =>
+                    Ok(Incoming::SetBeadPinMode { bead_name, pin_name, mode }) =>
                     {
                         todo!()
                     },
