@@ -1,19 +1,27 @@
-use std::io::Write;
-use std::{io, mem};
-use std::num::NonZero;
-use std::ops::ControlFlow;
-use std::task::{Poll, ready};
+use std::convert::Infallible;
+use std::{io, string};
 
-use crate::packet::{Deserializer, DeserializerString, DeserializerU8, DeserializerU16, DeserializerVec, InvalidEscape, Reset, Serialize};
+use crate::packet::{Deserialize, Serialize};
 
 use packet::incoming;
 use serde::ser::SerializeStruct;
+use tokio::io::{AsyncRead, AsyncWrite};
+
+#[derive(Clone, Debug)]
+pub enum InvalidPinModeOrUTF8
+{
+    InvalidPinMode { byte: u8 },
+    InvalidUTF8 { error: string::FromUtf8Error },
+}
+
+impl From<string::FromUtf8Error> for InvalidPinModeOrUTF8
+{
+    fn from(error: string::FromUtf8Error) -> Self { Self::InvalidUTF8 { error } }
+}
 
 pub mod packet;
 
 pub mod serial_handler;
-
-use ControlFlow::*;
 
 #[derive(Clone, Copy, Debug, Default, Hash, PartialEq, Eq)]
 pub struct PinFlags(u8);
@@ -67,9 +75,19 @@ impl From<PinFlags> for u8
 
 impl Serialize for PinFlags
 {
-    fn write_to(&self, writer: &mut impl Write) -> io::Result<()>
+    async fn write_to(&self, writer: &mut (impl AsyncWrite + Unpin)) -> io::Result<()>
     {
-        self.0.write_to(writer)
+        self.0.write_to(writer).await
+    }
+}
+
+impl Deserialize for PinFlags
+{
+    type Error = Infallible;
+
+    async fn read_from(reader: &mut (impl AsyncRead + Unpin)) -> Result<Self, crate::packet::Error<Self::Error>>
+    {
+        Ok(Self(u8::read_from(reader).await?))
     }
 }
 
@@ -127,30 +145,6 @@ impl<'de> serde::Deserialize<'de> for PinFlags
     }
 }
 
-#[derive(Clone, Debug, Default)]
-pub struct DeserializerPinFlags
-{
-    inner: DeserializerU8,
-}
-
-impl Deserializer for DeserializerPinFlags
-{
-    type Output = PinFlags;
-
-    type Error = InvalidEscape;
-
-    fn resume(&mut self, bytes: &[u8]) -> Poll<(NonZero<usize>, ControlFlow<Reset, Result<Self::Output, Self::Error>>)>
-    {
-        match self.inner.resume(bytes)
-        {
-            Poll::Ready((bytes_used, Continue(Ok(result)))) => Poll::Ready((bytes_used, Continue(Ok(result.into())))),
-            Poll::Ready((bytes_used, Continue(Err(error)))) => Poll::Ready((bytes_used, Continue(Err(error)))),
-            Poll::Ready((bytes_used, Break(cancel))) => Poll::Ready((bytes_used, Break(cancel))),
-            Poll::Pending => Poll::Pending,
-        }
-    }
-}
-
 #[derive(Clone, Copy, Debug, serde::Deserialize, serde::Serialize, Hash, PartialEq, Eq)]
 #[serde(rename_all = "kebab-case")]
 pub enum PinMode
@@ -197,49 +191,38 @@ impl TryFrom<u8> for PinMode
 
 impl Serialize for PinMode
 {
-    fn write_to(&self, writer: &mut impl Write) -> io::Result<()>
+    async fn write_to(&self, writer: &mut (impl AsyncWrite + Unpin)) -> io::Result<()>
     {
         match self
         {
-            Self::DigitalInput => 0u8.write_to(writer),
-            Self::DigitalListen => 1u8.write_to(writer),
-            Self::DigitalOutput => 2u8.write_to(writer),
-            Self::AnalogInput => 3u8.write_to(writer),
-            Self::AnalogOutput => 4u8.write_to(writer),
+            Self::DigitalInput => 0u8.write_to(writer).await,
+            Self::DigitalListen => 1u8.write_to(writer).await,
+            Self::DigitalOutput => 2u8.write_to(writer).await,
+            Self::AnalogInput => 3u8.write_to(writer).await,
+            Self::AnalogOutput => 4u8.write_to(writer).await,
         }
     }
 }
 
-#[derive(Clone, Debug, Default)]
-pub struct DeserializerPinMode
+impl Deserialize for PinMode
 {
-    inner: DeserializerU8,
-}
+    type Error = InvalidPinModeOrUTF8;
 
-impl Deserializer for DeserializerPinMode
-{
-    type Output = PinMode;
-
-    type Error = incoming::Error;
-
-    fn resume(&mut self, bytes: &[u8]) -> Poll<(NonZero<usize>, ControlFlow<Reset, Result<Self::Output, Self::Error>>)>
+    async fn read_from(reader: &mut (impl AsyncRead + Unpin)) -> Result<Self, crate::packet::Error<Self::Error>>
     {
-        match self.inner.resume(bytes)
+        match u8::read_from(reader).await.map_err(crate::packet::Error::upcast)?
         {
-            Poll::Ready((bytes_used, Continue(Ok(result)))) => Poll::Ready((bytes_used, Continue(match result.try_into()
-            {
-                Ok(x) => Ok(x),
-                Err(()) => Err(incoming::Error::IncomingInvalidPinMode { byte: result }),
-            }))),
-            Poll::Ready((bytes_used, Continue(Err(error)))) => Poll::Ready((bytes_used, Continue(Err(error.into())))),
-            Poll::Ready((bytes_used, Break(cancel))) => Poll::Ready((bytes_used, Break(cancel))),
-            Poll::Pending => Poll::Pending,
+            0 => Ok(Self::DigitalInput),
+            1 => Ok(Self::DigitalListen),
+            2 => Ok(Self::DigitalOutput),
+            3 => Ok(Self::AnalogInput),
+            4 => Ok(Self::AnalogOutput),
+            byte => Err(crate::packet::Error::Other(InvalidPinModeOrUTF8::InvalidPinMode { byte })),
         }
     }
 }
 
 #[derive(Clone, Debug, serde::Deserialize, serde::Serialize, PartialEq, Eq)]
-
 pub struct ConfigPin
 {
     name: String,
@@ -248,98 +231,24 @@ pub struct ConfigPin
 
 impl Serialize for ConfigPin
 {
-    fn write_to(&self, writer: &mut impl Write) -> io::Result<()>
+    async fn write_to(&self, writer: &mut (impl AsyncWrite + Unpin)) -> io::Result<()>
     {
-        self.name.write_to(writer)?;
-        self.flags.write_to(writer)
+        self.name.write_to(writer).await?;
+        self.flags.write_to(writer).await
     }
 }
 
-#[derive(Clone, Debug)]
-enum DeserializerConfigPinState
+impl Deserialize for ConfigPin
 {
-    Name { de: DeserializerString },
-    Flag { name: String, de: DeserializerPinFlags },
-    Done,
-}
+    type Error = string::FromUtf8Error;
 
-impl Default for DeserializerConfigPinState
-{
-    fn default() -> Self { Self::Name { de: <_>::default() } }
-}
-
-#[derive(Clone, Debug, Default)]
-pub struct DeserializerConfigPin
-{
-    state: DeserializerConfigPinState,
-}
-
-impl Deserializer for DeserializerConfigPin
-{
-    type Output = ConfigPin;
-
-    type Error = incoming::Error;
-
-    fn resume(&mut self, bytes: &[u8]) -> Poll<(NonZero<usize>, ControlFlow<Reset, Result<Self::Output, Self::Error>>)>
+    async fn read_from(reader: &mut (impl AsyncRead + Unpin)) -> Result<Self, crate::packet::Error<Self::Error>>
     {
-        use DeserializerConfigPinState::*;
-
-        let mut total_bytes = 0;
-
-        loop
+        Ok(Self
         {
-            match self.state
-            {
-                Name { ref mut de } =>
-                {
-                    match ready!(de.resume(&bytes[total_bytes..]))
-                    {
-                        (bytes_used, Continue(Ok(name))) =>
-                        {
-                            total_bytes += bytes_used.get();
-                            self.state = Flag { name, de: <_>::default() };
-                        },
-                        (bytes_used, Continue(Err(error))) =>
-                        {
-                            total_bytes += bytes_used.get();
-                            return Poll::Ready((NonZero::new(total_bytes).unwrap(), Continue(Err(error.into()))));
-                        },
-                        (bytes_used, Break(cancel)) =>
-                        {
-                            total_bytes += bytes_used.get();
-                            return Poll::Ready((NonZero::new(total_bytes).unwrap(), Break(cancel)));
-                        },
-                    }
-                },
-                Flag { ref mut name, ref mut de } =>
-                {
-                    match ready!(de.resume(&bytes[total_bytes..]))
-                    {
-                        (bytes_used, Continue(Ok(flags))) =>
-                        {
-                            total_bytes += bytes_used.get();
-                            let pin = ConfigPin { name: mem::take(name), flags };
-                            self.state = Done;
-                            return Poll::Ready((NonZero::new(total_bytes).unwrap(), Continue(Ok(pin))));
-                        },
-                        (bytes_used, Continue(Err(error))) =>
-                        {
-                            total_bytes += bytes_used.get();
-                            return Poll::Ready((NonZero::new(total_bytes).unwrap(), Continue(Err(error.into()))));
-                        },
-                        (bytes_used, Break(cancel)) =>
-                        {
-                            total_bytes += bytes_used.get();
-                            return Poll::Ready((NonZero::new(total_bytes).unwrap(), Break(cancel)));
-                        },
-                    }
-                },
-                Done =>
-                {
-                    panic!("cannot resume completed deserializer");
-                },
-            }
-        }
+            name: String::read_from(reader).await?,
+            flags: PinFlags::read_from(reader).await.map_err(crate::packet::Error::upcast)?,
+        })
     }
 }
 
@@ -353,120 +262,25 @@ pub struct Config
 
 impl Serialize for Config
 {
-    fn write_to(&self, writer: &mut impl Write) -> io::Result<()>
+    async fn write_to(&self, writer: &mut (impl AsyncWrite + Unpin)) -> io::Result<()>
     {
-        self.version.write_to(writer)?;
-        self.name.write_to(writer)?;
-        self.pins.write_to(writer)
+        self.version.write_to(writer).await?;
+        self.name.write_to(writer).await?;
+        self.pins.write_to(writer).await
     }
 }
 
-#[derive(Clone, Debug)]
-enum DeserializerConfigState
+impl Deserialize for Config
 {
-    Version { de: DeserializerU16 },
-    Name { version: u16, de: DeserializerString },
-    Pins { version: u16, name: String, de: DeserializerVec<DeserializerConfigPin> },
-    Done,
-}
+    type Error = string::FromUtf8Error;
 
-impl Default for DeserializerConfigState
-{
-    fn default() -> Self { Self::Version { de: <_>::default() } }
-}
-
-#[derive(Clone, Debug, Default)]
-pub struct DeserializerConfig
-{
-    state: DeserializerConfigState,
-}
-
-impl Deserializer for DeserializerConfig
-{
-    type Output = Config;
-
-    type Error = incoming::Error;
-
-    fn resume(&mut self, bytes: &[u8]) -> Poll<(NonZero<usize>, ControlFlow<Reset, Result<Self::Output, Self::Error>>)>
+    async fn read_from(reader: &mut (impl AsyncRead + Unpin)) -> Result<Self, crate::packet::Error<Self::Error>>
     {
-        use DeserializerConfigState::*;
-
-        let mut total_bytes = 0;
-
-        loop
+        Ok(Self
         {
-            match self.state
-            {
-                Version { ref mut de } =>
-                {
-                    match ready!(de.resume(&bytes[total_bytes..]))
-                    {
-                        (bytes_used, Continue(Ok(version))) =>
-                        {
-                            total_bytes += bytes_used.get();
-                            self.state = Name { version, de: <_>::default() };
-                        },
-                        (bytes_used, Continue(Err(error))) =>
-                        {
-                            total_bytes += bytes_used.get();
-                            return Poll::Ready((NonZero::new(total_bytes).unwrap(), Continue(Err(error.into()))));
-                        },
-                        (bytes_used, Break(cancel)) =>
-                        {
-                            total_bytes += bytes_used.get();
-                            return Poll::Ready((NonZero::new(total_bytes).unwrap(), Break(cancel)));
-                        },
-                    }
-                },
-                Name { ref mut version, ref mut de } =>
-                {
-                    match ready!(de.resume(&bytes[total_bytes..]))
-                    {
-                        (bytes_used, Continue(Ok(name))) =>
-                        {
-                            total_bytes += bytes_used.get();
-                            self.state = Pins { version: *version, name, de: DeserializerVec::default() };
-                        },
-                        (bytes_used, Continue(Err(error))) =>
-                        {
-                            total_bytes += bytes_used.get();
-                            return Poll::Ready((NonZero::new(total_bytes).unwrap(), Continue(Err(error.into()))));
-                        },
-                        (bytes_used, Break(cancel)) =>
-                        {
-                            total_bytes += bytes_used.get();
-                            return Poll::Ready((NonZero::new(total_bytes).unwrap(), Break(cancel)));
-                        },
-                    }
-                },
-                Pins { ref mut version, ref mut name, ref mut de } =>
-                {
-                    match ready!(de.resume(&bytes[total_bytes..]))
-                    {
-                        (bytes_used, Continue(Ok(pins))) =>
-                        {
-                            total_bytes += bytes_used.get();
-                            let config = Config { version: *version, name: mem::take(name), pins };
-                            self.state = Done;
-                            return Poll::Ready((NonZero::new(total_bytes).unwrap(), Continue(Ok(config))));
-                        },
-                        (bytes_used, Continue(Err(error))) =>
-                        {
-                            total_bytes += bytes_used.get();
-                            return Poll::Ready((NonZero::new(total_bytes).unwrap(), Continue(Err(error.into()))));
-                        },
-                        (bytes_used, Break(cancel)) =>
-                        {
-                            total_bytes += bytes_used.get();
-                            return Poll::Ready((NonZero::new(total_bytes).unwrap(), Break(cancel)));
-                        },
-                    }
-                },
-                Done =>
-                {
-                    panic!("cannot resume completed deserializer");
-                },
-            }
-        }
+            version: u16::read_from(reader).await.map_err(crate::packet::Error::upcast)?,
+            name: String::read_from(reader).await?,
+            pins: Vec::read_from(reader).await?,
+        })
     }
 }

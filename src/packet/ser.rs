@@ -1,6 +1,4 @@
-use std::io::Write;
-
-use tokio::io;
+use tokio::io::{self, AsyncWrite, AsyncWriteExt};
 
 use crate::packet::{ESCAPE, START};
 
@@ -8,92 +6,90 @@ use super::Reset;
 
 pub trait Serialize
 {
-    fn write_to(&self, writer: &mut impl Write) -> io::Result<()>;
-
-    fn write_size(&self) -> (usize, Option<usize>) { (0, None) }
+    async fn write_to(&self, writer: &mut (impl AsyncWrite + Unpin)) -> io::Result<()>;
 }
 
 impl<T: Serialize> Serialize for &T
 {
-    fn write_to(&self, writer: &mut impl Write) -> io::Result<()>
+    async fn write_to(&self, writer: &mut (impl AsyncWrite + Unpin)) -> io::Result<()>
     {
-        (*self).write_to(writer)
+        (*self).write_to(writer).await
     }
 }
 
 impl<T: Serialize> Serialize for &mut T
 {
-    fn write_to(&self, writer: &mut impl Write) -> io::Result<()>
+    async fn write_to(&self, writer: &mut (impl AsyncWrite + Unpin)) -> io::Result<()>
     {
-        (**self).write_to(writer)
+        (**self).write_to(writer).await
     }
 }
 
 impl Serialize for Reset
 {
-    fn write_to(&self, writer: &mut impl Write) -> io::Result<()>
+    async fn write_to(&self, writer: &mut (impl AsyncWrite + Unpin)) -> io::Result<()>
     {
-        writer.write_all(&[ESCAPE, START])
+        writer.write_all(&[ESCAPE, START]).await
     }
 }
 
 impl Serialize for u8
 {
-    fn write_to(&self, writer: &mut impl Write) -> io::Result<()>
+    async fn write_to(&self, writer: &mut (impl AsyncWrite + Unpin)) -> io::Result<()>
     {
         match self.to_be_bytes()
         {
-            [ESCAPE] => writer.write_all(&[ESCAPE, ESCAPE]),
-            [byte] => writer.write_all(&[byte]),
+            [ESCAPE] => writer.write_all(&[ESCAPE, ESCAPE]).await,
+            [byte] => writer.write_all(&[byte]).await,
         }
     }
 }
 
 impl Serialize for u16
 {
-    fn write_to(&self, writer: &mut impl Write) -> io::Result<()>
+    async fn write_to(&self, writer: &mut (impl AsyncWrite + Unpin)) -> io::Result<()>
     {
         match self.to_be_bytes()
         {
-            [ESCAPE, ESCAPE] => writer.write_all(&[ESCAPE, ESCAPE, ESCAPE, ESCAPE]),
-            [byte0, ESCAPE] => writer.write_all(&[byte0, ESCAPE, ESCAPE]),
-            [ESCAPE, byte1] => writer.write_all(&[ESCAPE, ESCAPE, byte1]),
-            [byte0, byte1] => writer.write_all(&[byte0, byte1]),
+            [ESCAPE, ESCAPE] => writer.write_all(&[ESCAPE, ESCAPE, ESCAPE, ESCAPE]).await,
+            [byte0, ESCAPE] => writer.write_all(&[byte0, ESCAPE, ESCAPE]).await,
+            [ESCAPE, byte1] => writer.write_all(&[ESCAPE, ESCAPE, byte1]).await,
+            [byte0, byte1] => writer.write_all(&[byte0, byte1]).await,
         }
     }
 }
 
 impl<T: Serialize> Serialize for [T]
 {
-    fn write_to(&self, writer: &mut impl Write) -> io::Result<()>
+    async fn write_to(&self, writer: &mut (impl AsyncWrite + Unpin)) -> io::Result<()>
     {
-        u16::try_from(self.len()).expect("slice length exceeds u16::MAX").write_to(writer)?;
-        for item in self { item.write_to(writer)? }
+        u16::try_from(self.len()).expect("slice length exceeds u16::MAX").write_to(writer).await?;
+        for item in self { item.write_to(writer).await? }
         Ok(())
     }
 }
 
 impl<T: Serialize> Serialize for Vec<T>
 {
-    fn write_to(&self, writer: &mut impl Write) -> io::Result<()>
+    async fn write_to(&self, writer: &mut (impl AsyncWrite + Unpin)) -> io::Result<()>
     {
-        self.as_slice().write_to(writer)
+        self.as_slice().write_to(writer).await
     }
 }
 
 impl Serialize for str
 {
-    fn write_to(&self, writer: &mut impl Write) -> io::Result<()>
+    async fn write_to(&self, writer: &mut (impl AsyncWrite + Unpin)) -> io::Result<()>
     {
-        self.as_bytes().write_to(writer)
+        self.as_bytes().write_to(writer).await
     }
 }
 
 impl Serialize for String
 {
-    fn write_to(&self, writer: &mut impl Write) -> io::Result<()>
+    async fn write_to(&self, writer: &mut (impl AsyncWrite + Unpin)) -> io::Result<()>
     {
-        self.as_str().write_to(writer)
+        self.as_str().write_to(writer).await
     }
 }
 
@@ -105,9 +101,9 @@ macro_rules! impl_tuple
             impl< $( $ty : Serialize,)* > Serialize for ( $( $ty ,)* )
             {
                 #[allow(unused_variables)]
-                fn write_to(&self, writer: &mut impl Write) -> io::Result<()>
+                async fn write_to(&self, writer: &mut (impl AsyncWrite + Unpin)) -> io::Result<()>
                 {
-                    $(self. $field .write_to(writer)?;)*
+                    $(self. $field .write_to(writer).await?;)*
                     Ok(())
                 }
             }

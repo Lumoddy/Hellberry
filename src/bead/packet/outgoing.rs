@@ -1,5 +1,4 @@
-use std::io::Write;
-use tokio::io;
+use tokio::io::{self, AsyncWrite};
 
 use crate::bead::PinMode;
 use crate::packet::Serialize;
@@ -17,16 +16,16 @@ pub enum Packet
 
 impl Serialize for Packet
 {
-    fn write_to(&self, writer: &mut impl Write) -> io::Result<()>
+    async fn write_to(&self, writer: &mut (impl AsyncWrite + Unpin)) -> io::Result<()>
     {
         match self
         {
-            Self::Ping => (0u8,).write_to(writer),
-            Self::WholeConfig => (1u8,).write_to(writer),
-            Self::GetPinPower { pin } => (2u8, pin).write_to(writer),
-            Self::GetPinMode { pin } => (3u8, pin).write_to(writer),
-            Self::SetPinPower { pin, power } => (4u8, pin, power).write_to(writer),
-            Self::SetPinMode { pin, mode } => (5u8, pin, mode).write_to(writer),
+            Self::Ping => (0u8,).write_to(writer).await,
+            Self::WholeConfig => (1u8,).write_to(writer).await,
+            Self::GetPinPower { pin } => (2u8, pin).write_to(writer).await,
+            Self::GetPinMode { pin } => (3u8, pin).write_to(writer).await,
+            Self::SetPinPower { pin, power } => (4u8, pin, power).write_to(writer).await,
+            Self::SetPinMode { pin, mode } => (5u8, pin, mode).write_to(writer).await,
         }
     }
 }

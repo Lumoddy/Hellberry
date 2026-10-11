@@ -85,19 +85,19 @@ pub fn router() -> Router
         }))
         .route("/ws", routing::get(async move |ws| WebSocketUpgrade::on_upgrade(ws, async move |mut ws|
         {
-            #[derive(Clone, Debug, serde::Deserialize, PartialEq, Eq)]
+            #[derive(Clone, Debug, serde::Deserialize, PartialEq)]
             #[serde(tag = "tag", rename_all = "kebab-case")]
             enum Incoming
             {
                 Ping,
                 WholeConfig,
-                GetBeadPinPower { bead_name: String, pin_name: String, power: u16 },
+                GetBeadPinPower { bead_name: String, pin_name: String, power: f32 },
                 GetBeadPinMode { bead_name: String, pin_name: String, mode: PinMode },
-                SetBeadPinPower { bead_name: String, pin_name: String, power: u16 },
+                SetBeadPinPower { bead_name: String, pin_name: String, power: f32 },
                 SetBeadPinMode { bead_name: String, pin_name: String, mode: PinMode },
             }
 
-            #[derive(Clone, Debug, serde::Serialize, PartialEq, Eq)]
+            #[derive(Clone, Debug, serde::Serialize, PartialEq)]
             #[serde(tag = "tag", rename_all = "kebab-case")]
             enum Outgoing
             {
@@ -107,13 +107,13 @@ pub fn router() -> Router
                     #[serde(skip_serializing_if = "Option::is_none")]
                     name: Option<String>,
                 },
-                GetBeadPinPowerResponse { bead_name: String, pin_name: String, power: u16 },
+                GetBeadPinPowerResponse { bead_name: String, pin_name: String, power: f32 },
                 GetBeadPinModeResponse { bead_name: String, pin_name: String, mode: PinMode },
-                SetBeadPinPowerResponse { bead_name: String, pin_name: String, power: u16 },
+                SetBeadPinPowerResponse { bead_name: String, pin_name: String, power: f32 },
                 SetBeadPinModeResponse { bead_name: String, pin_name: String, mode: PinMode },
-                BeadPinListen { bead_name: String, pin_name: String, power: u16 },
+                BeadPinListen { bead_name: String, pin_name: String, power: f32 },
                 InvalidBeadPinName { pin_name: String },
-                InvalidWriteToInput { pin_name: String, power: u16 },
+                InvalidWriteToInput { pin_name: String, power: f32 },
                 InvalidUnsupportedMode { pin_name: String, mode: PinMode },
                 InvalidIncoming,
             }
