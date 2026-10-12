@@ -3,7 +3,6 @@ use std::{io, string};
 
 use crate::packet::{Deserialize, Serialize};
 
-use packet::incoming;
 use serde::ser::SerializeStruct;
 use tokio::io::{AsyncRead, AsyncWrite};
 

@@ -1,10 +1,13 @@
 use std::env;
 use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::time::Duration;
 
+use bead::serial_handler::SerialHandler;
 use config::{Configuration, read_config};
 use router::router;
+use tokio::time::timeout;
 use tokio::{select, signal};
 use tokio::net::{TcpListener, UdpSocket};
 use tokio::sync::OnceCell;
@@ -22,6 +25,7 @@ use log::*;
 
 static CURRENT_DIR: OnceCell<PathBuf> = OnceCell::const_new();
 static CONFIG: OnceCell<Configuration> = OnceCell::const_new();
+static SERIAL_HANDLER: OnceCell<SerialHandler> = OnceCell::const_new();
 
 #[tokio::main]
 async fn main()
@@ -160,27 +164,37 @@ async fn main()
 
             CONFIG.set(config).unwrap();
 
+            SERIAL_HANDLER.set(SerialHandler::new()).map_err(drop).unwrap();
+
             tokio::spawn(async move
             {
-                axum::serve(listener, router())
+                while timeout(
+                    Duration::from_secs_f32(0.5),
+                    shutdown_signal()).await.is_err()
+                {
+                    SERIAL_HANDLER.get().unwrap().update().await;
+                }
+            });
+
+            tokio::spawn(async move
+            {
+                axum::serve(listener, router(&SERIAL_HANDLER.get().unwrap()))
                     .with_graceful_shutdown(shutdown_signal())
                     .await
             });
 
             tokio::spawn(async move
             {
-                let mut interval = tokio::time::interval(Duration::from_secs_f32(1.0));
                 let message = format!("[Hellberry:{}]", local_ip);
 
-                loop
+                while timeout(
+                    Duration::from_secs_f32(1.0),
+                    shutdown_signal()).await.is_err()
                 {
-                    select!
+                    if let Err(x) = broadcaster.send(message.as_bytes()).await
                     {
-                        _ = shutdown_signal() => break,
-                        _ = interval.tick() => (),
+                        eprintln!("{Warn} Failed to broadcast: {}.", x);
                     }
-
-                    broadcaster.send(message.as_bytes()).await.unwrap();
                 }
             });
         },

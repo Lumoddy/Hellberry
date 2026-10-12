@@ -10,8 +10,8 @@ pub enum Packet
     Config(Config),
     GetPinPowerResponse { pin: u8, power: u16 },
     GetPinModeResponse { pin: u8, mode: PinMode },
-    SetPinPowerResponse { pin: u8, power: u16 },
-    SetPinModeResponse { pin: u8, mode: PinMode },
+    SetPinPowerResponse { pin: u8 },
+    SetPinModeResponse { pin: u8 },
     PinListen { pin: u8, power: u16 },
     InvalidPinMode { byte: u8 },
     InvalidPinId { byte: u8 },
@@ -44,12 +44,10 @@ impl Deserialize for Packet
             4 => Ok(Packet::SetPinPowerResponse
             {
                 pin: u8::read_from(reader).await.map_err(packet::Error::upcast)?,
-                power: u16::read_from(reader).await.map_err(packet::Error::upcast)?,
             }),
             5 => Ok(Packet::SetPinModeResponse
             {
                 pin: u8::read_from(reader).await.map_err(packet::Error::upcast)?,
-                mode: PinMode::read_from(reader).await?,
             }),
             6 => Ok(Packet::PinListen
             {
