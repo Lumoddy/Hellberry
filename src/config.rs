@@ -1,18 +1,17 @@
+use std::cell::Cell;
+use std::fmt;
 use std::io::ErrorKind;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use serde::Deserialize;
-use tokio::fs;
-use tokio::sync::OnceCell;
-
-use crate::{CURRENT_DIR, log::*};
+use tokio::{fs, io, select};
 
 #[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq)]
 pub struct Configuration
 {
-    #[serde(rename = "name", alias = "Name")]
+    #[serde(rename = "berry-name", alias = "berryName", alias = "Berry Name", alias = "name", alias = "Name")]
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub name: Option<String>,
+    pub berry_name: Option<String>,
     #[serde(rename = "logo-path", alias = "logoPath", alias = "Logo Path")]
     #[serde(skip_serializing_if = "Option::is_none")]
     pub logo_path: Option<PathBuf>,
@@ -27,100 +26,139 @@ pub struct Configuration
     pub broadcast_port: Option<u16>,
 }
 
-pub async fn read_config() -> Option<Configuration>
+#[derive(Debug)]
+pub enum ReadError
 {
-    static PATH_JSON: OnceCell<PathBuf> = OnceCell::const_new();
+    Io(io::Error),
+    JsonLenient(serde_json_lenient::Error),
+    Yaml(serde_yaml::Error),
+}
 
-    let path_json = PATH_JSON.get_or_init(async ||
+impl fmt::Display for ReadError
+{
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result
     {
-        let mut path = CURRENT_DIR.get().unwrap().clone();
-        path.extend(["config.json"]);
-        path
-    })
-        .await;
-
-    match fs::read(path_json).await
-    {
-        Ok(file) =>
+        match self
         {
-            match serde_json_lenient::from_slice(&file)
-            {
-                Ok(x) => return Some(x),
-                Err(error) => eprintln!("{Warn}: Failed to read configuration file: {}.", error),
-            }
+            ReadError::Io(x) => x.fmt(f),
+            ReadError::JsonLenient(x) => x.fmt(f),
+            ReadError::Yaml(x) => x.fmt(f),
         }
-        Err(error) =>
-        {
-            match error.kind()
-            {
-                ErrorKind::NotFound => (),
-                _ => eprintln!("{Warn}: Failed to find configuration file: {}.", error),
-            }
-        },
     }
+}
 
-    static PATH_JSONC: OnceCell<PathBuf> = OnceCell::const_new();
+impl From<io::Error> for ReadError
+{
+    fn from(value: io::Error) -> Self { Self::Io(value) }
+}
 
-    let path_jsonc = PATH_JSONC.get_or_init(async ||
+impl From<serde_json_lenient::Error> for ReadError
+{
+    fn from(value: serde_json_lenient::Error) -> Self { Self::JsonLenient(value) }
+}
+
+impl From<serde_yaml::Error> for ReadError
+{
+    fn from(value: serde_yaml::Error) -> Self { Self::Yaml(value) }
+}
+
+pub async fn read_config(dir_path: &Path) -> Result<Configuration, heapless::Vec<(&'static str, ReadError), 3>>
+{
+    let json_error = Cell::new(None);
+    let jsonc_error = Cell::new(None);
+    let yaml_error = Cell::new(None);
+
+    select!
     {
-        let mut path = CURRENT_DIR.get().unwrap().clone();
-        path.extend(["config.jsonc"]);
-        path
-    })
-        .await;
-
-    match fs::read(path_jsonc).await
-    {
-        Ok(file) =>
+        Ok(config) = async
         {
-            match serde_json_lenient::from_slice(&file)
+            match fs::read(dir_path.join("config.json")).await
             {
-                Ok(x) => return Some(x),
-                Err(error) => eprintln!("{Warn}: Failed to read configuration file: {}.", error),
-            }
-        }
-        Err(error) =>
-        {
-            match error.kind()
-            {
-                ErrorKind::NotFound => (),
-                _ => eprintln!("{Warn}: Failed to find configuration file: {}.", error),
-            }
-        },
-    }
-
-    static PATH_YAML: OnceCell<PathBuf> = OnceCell::const_new();
-
-    let path_yaml = PATH_YAML.get_or_init(async ||
-    {
-        let mut path = CURRENT_DIR.get().unwrap().clone();
-        path.extend(["config.yaml"]);
-        path
-    })
-        .await;
-
-    match fs::read(path_yaml).await
-    {
-        Ok(file) =>
-        {
-            match serde_yaml::from_slice(&file)
-            {
-                Ok(x) => return Some(x),
+                Ok(file) =>
+                {
+                    match serde_json_lenient::from_slice(&file)
+                    {
+                        Ok(x) => Ok(x),
+                        Err(x) => Err(json_error.set(Some(x.into()))),
+                    }
+                }
                 Err(error) =>
-                eprintln!("{Warn}: Failed to read configuration file: {}.", error),
+                {
+                    match error.kind()
+                    {
+                        ErrorKind::NotFound => Err(()),
+                        _ => Err(json_error.set(Some(error.into()))),
+                    }
+                },
             }
         }
-        Err(error) =>
+        => Ok(config),
+        Ok(config) = async
         {
-            match error.kind()
+            match fs::read(dir_path.join("config.jsonc")).await
             {
-                ErrorKind::NotFound => (),
-                _ => eprintln!("{Warn}: Failed to find configuration file: {}.", error),
+                Ok(file) =>
+                {
+                    match serde_json_lenient::from_slice(&file)
+                    {
+                        Ok(x) => Ok(x),
+                        Err(x) => Err(json_error.set(Some(x.into()))),
+                    }
+                }
+                Err(error) =>
+                {
+                    match error.kind()
+                    {
+                        ErrorKind::NotFound => Err(()),
+                        _ => Err(json_error.set(Some(error.into()))),
+                    }
+                },
             }
+        }
+        => Ok(config),
+        Ok(config) = async
+        {
+            match fs::read(dir_path.join("config.yaml")).await
+            {
+                Ok(file) =>
+                {
+                    match serde_yaml::from_slice(&file)
+                    {
+                        Ok(x) => Ok(x),
+                        Err(x) => Err(json_error.set(Some(x.into()))),
+                    }
+                }
+                Err(error) =>
+                {
+                    match error.kind()
+                    {
+                        ErrorKind::NotFound => Err(()),
+                        _ => Err(json_error.set(Some(error.into()))),
+                    }
+                },
+            }
+        }
+        => Ok(config),
+        else =>
+        {
+            let mut errors = heapless::Vec::new();
+
+            if let Some(x) = json_error.into_inner()
+            {
+                errors.push(("config.json", x)).ok().unwrap();
+            }
+
+            if let Some(x) = jsonc_error.into_inner()
+            {
+                errors.push(("config.jsonc", x)).ok().unwrap();
+            }
+
+            if let Some(x) = yaml_error.into_inner()
+            {
+                errors.push(("config.yaml", x)).ok().unwrap();
+            }
+
+            Err(errors)
         },
     }
-
-    eprintln!("{Warn}: No configuration file found, using default configuration.");
-
-    None
 }
