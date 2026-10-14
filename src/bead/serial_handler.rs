@@ -1,23 +1,24 @@
-use std::borrow::Borrow;
 use std::collections::{HashMap, hash_map};
-use std::hash::Hash;
-use std::io::ErrorKind;
+use std::future::{pending, poll_fn};
+use std::pin::Pin;
+use std::sync::Arc;
+use std::task::{Context, Poll};
 use std::time::Duration;
 
-use tokio::io::{self, AsyncWriteExt, BufReader, BufWriter};
+use pin_vec::PinEach;
+use tokio::io::{self, AsyncWrite, AsyncWriteExt, BufReader, BufWriter};
+use tokio::select;
 use tokio::time::timeout;
-use tokio::sync::{Mutex, OnceCell, mpsc, oneshot};
+use tokio::sync::{Mutex, watch};
 use tokio_serial::{SerialPortBuilderExt, SerialPortType, SerialStream, UsbPortInfo};
 
 use crate::bead::packet::outgoing;
 use crate::packet;
 use crate::packet::{Deserialize, Serialize};
+use crate::log::*;
 
-use super::{Config, PinMode};
+use super::{Config, PinFlags, PinMode};
 use super::packet::incoming;
-
-#[derive(Clone, Copy, Debug, Default, Hash, PartialEq, Eq, PartialOrd, Ord)]
-pub struct BeadClosed;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PingError
@@ -25,20 +26,10 @@ pub enum PingError
     BeadClosed,
 }
 
-impl From<BeadClosed> for PingError
-{
-    fn from(_: BeadClosed) -> Self { Self::BeadClosed }
-}
-
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum WholeConfigError
 {
     BeadClosed,
-}
-
-impl From<BeadClosed> for WholeConfigError
-{
-    fn from(_: BeadClosed) -> Self { Self::BeadClosed }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -48,11 +39,6 @@ pub enum GetPinPowerError
     InvalidBeadPinName,
 }
 
-impl From<BeadClosed> for GetPinPowerError
-{
-    fn from(_: BeadClosed) -> Self { Self::BeadClosed }
-}
-
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum GetPinModeError
 {
@@ -60,22 +46,12 @@ pub enum GetPinModeError
     InvalidBeadPinName,
 }
 
-impl From<BeadClosed> for GetPinModeError
-{
-    fn from(_: BeadClosed) -> Self { Self::BeadClosed }
-}
-
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SetPinPowerError
 {
     BeadClosed,
     InvalidBeadPinName,
-    InvalidWriteToInput,
-}
-
-impl From<BeadClosed> for SetPinPowerError
-{
-    fn from(_: BeadClosed) -> Self { Self::BeadClosed }
+    InvalidWriteToInput { power: u16 },
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -83,49 +59,43 @@ pub enum SetPinModeError
 {
     BeadClosed,
     InvalidBeadPinName,
-    InvalidUnsupportedMode,
+    InvalidUnsupportedMode { mode: PinMode },
 }
 
-impl From<BeadClosed> for SetPinModeError
+#[derive(Debug, Default)]
+enum SerialHandlerConnectionState
 {
-    fn from(_: BeadClosed) -> Self { Self::BeadClosed }
+    #[default]
+    WaitingConfig,
+    Active
+    {
+        name: String,
+        pins: Vec<(String, SerialHandlerPinConnection)>,
+    },
 }
 
 #[derive(Debug)]
-pub enum QueueAction
-{
-    Ping
-    {
-        complete: oneshot::Sender<Result<(), PingError>>,
-    },
-    GetPinPower
-    {
-        pin_name: String,
-        complete: oneshot::Sender<Result<f32, GetPinPowerError>>,
-    },
-    GetPinMode
-    {
-        pin_name: String,
-        complete: oneshot::Sender<Result<PinMode, GetPinModeError>>,
-    },
-    SetPinPower
-    {
-        pin_name: String,
-        power: f32,
-        complete: oneshot::Sender<Result<(), SetPinPowerError>>,
-    },
-    SetPinMode
-    {
-        pin_name: String,
-        mode: PinMode,
-        complete: oneshot::Sender<Result<(), SetPinModeError>>,
-    },
-}
-
 struct SerialHandlerConnection
 {
-    config: OnceCell<Config>,
-    queue: mpsc::UnboundedSender<QueueAction>,
+    closed: watch::Receiver<bool>,
+    ping: watch::Sender<()>,
+    ping_result: watch::Receiver<()>,
+    state: watch::Receiver<SerialHandlerConnectionState>,
+}
+
+#[derive(Debug)]
+struct SerialHandlerPinConnection
+{
+    flags: PinFlags,
+    get_power: watch::Sender<()>,
+    get_power_result: watch::Receiver<u16>,
+    get_mode: watch::Sender<()>,
+    get_mode_result: watch::Receiver<PinMode>,
+    set_power: watch::Sender<u16>,
+    set_power_result: watch::Receiver<Result<u16, SetPinPowerError>>,
+    set_mode: watch::Sender<PinMode>,
+    set_mode_result: watch::Receiver<Result<PinMode, SetPinModeError>>,
+    listen_result: watch::Receiver<u16>,
 }
 
 pub struct SerialHandler
@@ -143,155 +113,13 @@ impl SerialHandler
         }
     }
 
-    pub async fn ping<Q: ?Sized>(&self, bead_name: &Q)
-        -> Result<(), Option<PingError>>
-    where
-        String: Borrow<Q>,
-        Q: Hash + Eq,
+    pub async fn update(self: Arc<Self>, mut new: impl AsyncFnMut(&str))
     {
-        let lock = self.connected.lock().await;
+        let available_ports = tokio_serial::available_ports().unwrap();
 
-        let Some(connection) = lock.get(bead_name)
-        else { return Err(None) };
-
-        let (tx, rx) = oneshot::channel();
-        if connection.queue.send(
-            QueueAction::Ping { complete: tx })
-            .is_err() { return Err(None) }
-
-        drop(lock);
-
-        match rx.await
-        {
-            Ok(Ok(x)) => Ok(x),
-            Ok(Err(x)) => Err(Some(x)),
-            Err(_) => Err(None),
-        }
-    }
-
-    pub async fn config<Q: ?Sized>(&self, bead_name: &Q)
-        -> Result<Option<Config>, ()>
-    where
-        String: Borrow<Q>,
-        Q: Hash + Eq,
-    {
-        let lock = self.connected.lock().await;
-
-        let Some(connection) = lock.get(bead_name)
-        else { return Err(()) };
-
-        Ok(connection.config.get().cloned())
-    }
-
-    pub async fn get_pin_power<Q: ?Sized>(&self, bead_name: &Q, pin_name: impl Into<String>)
-        -> Result<f32, Option<GetPinPowerError>>
-    where
-        String: Borrow<Q>,
-        Q: Hash + Eq,
-    {
-        let lock = self.connected.lock().await;
-
-        let Some(connection) = lock.get(bead_name)
-        else { return Err(None) };
-
-        let (tx, rx) = oneshot::channel();
-        if connection.queue.send(
-            QueueAction::GetPinPower { pin_name: pin_name.into(), complete: tx })
-            .is_err() { return Err(None) }
-
-        drop(lock);
-
-        match rx.await
-        {
-            Ok(Ok(x)) => Ok(x),
-            Ok(Err(x)) => Err(Some(x)),
-            Err(_) => Err(None),
-        }
-    }
-
-    pub async fn get_pin_mode<Q: ?Sized>(&self, bead_name: &Q, pin_name: impl Into<String>)
-        -> Result<PinMode, Option<GetPinModeError>>
-    where
-        String: Borrow<Q>,
-        Q: Hash + Eq,
-    {
-        let lock = self.connected.lock().await;
-
-        let Some(connection) = lock.get(bead_name)
-        else { return Err(None) };
-
-        let (tx, rx) = oneshot::channel();
-        if connection.queue.send(
-            QueueAction::GetPinMode { pin_name: pin_name.into(), complete: tx })
-            .is_err() { return Err(None) }
-
-        drop(lock);
-
-        match rx.await
-        {
-            Ok(Ok(x)) => Ok(x),
-            Ok(Err(x)) => Err(Some(x)),
-            Err(_) => Err(None),
-        }
-    }
-
-    pub async fn set_pin_power<Q: ?Sized>(&self, bead_name: &Q, pin_name: impl Into<String>, power: f32)
-        -> Result<(), Option<SetPinPowerError>>
-    where
-        String: Borrow<Q>,
-        Q: Hash + Eq,
-    {
-        let lock = self.connected.lock().await;
-
-        let Some(connection) = lock.get(bead_name)
-        else { return Err(None) };
-
-        let (tx, rx) = oneshot::channel();
-        if connection.queue.send(
-            QueueAction::SetPinPower { pin_name: pin_name.into(), power, complete: tx })
-            .is_err() { return Err(None) }
-
-        drop(lock);
-
-        match rx.await
-        {
-            Ok(Ok(x)) => Ok(x),
-            Ok(Err(x)) => Err(Some(x)),
-            Err(_) => Err(None),
-        }
-    }
-
-    pub async fn set_pin_mode<Q: ?Sized>(&self, bead_name: &Q, pin_name: impl Into<String>, mode: PinMode)
-        -> Result<(), Option<SetPinModeError>>
-    where
-        String: Borrow<Q>,
-        Q: Hash + Eq,
-    {
-        let lock = self.connected.lock().await;
-
-        let Some(connection) = lock.get(bead_name)
-        else { return Err(None) };
-
-        let (tx, rx) = oneshot::channel();
-        if connection.queue.send(
-            QueueAction::SetPinMode { pin_name: pin_name.into(), mode, complete: tx })
-            .is_err() { return Err(None) }
-
-        drop(lock);
-
-        match rx.await
-        {
-            Ok(Ok(x)) => Ok(x),
-            Ok(Err(x)) => Err(Some(x)),
-            Err(_) => Err(None),
-        }
-    }
-
-    pub async fn update(&self, mut new: impl FnMut(String, oneshot::Receiver<()>))
-    {
         let mut connected = self.connected.lock().await;
 
-        for info in tokio_serial::available_ports().unwrap()
+        for info in available_ports
         {
             if let SerialPortType::UsbPort(UsbPortInfo
             {
@@ -305,24 +133,13 @@ impl SerialHandler
                     match tokio_serial::new(info.port_name, 9600).open_native_async()
                     {
                         Err(_) => (),
-                        Ok(stream) => match connected.entry(serial_number.clone())
+                        Ok(stream) => match connected.entry(serial_number)
                         {
                             hash_map::Entry::Occupied(_) => (),
                             hash_map::Entry::Vacant(entry) =>
                             {
-                                let (tx, rx) = mpsc::unbounded_channel();
-                                let (close_tx, close_rx) = oneshot::channel();
-                                entry.insert(SerialHandlerConnection
-                                {
-                                    config: <_>::default(),
-                                    queue: tx,
-                                });
-                                new(serial_number, close_rx);
-                                tokio::spawn(async move
-                                {
-                                    handle(rx, stream).await;
-                                    _ = close_tx.send(());
-                                });
+                                new(entry.key()).await;
+                                tokio::spawn(handle(entry, stream));
                             },
                         },
                     }
@@ -335,204 +152,461 @@ impl SerialHandler
 const ANALOG_READ_MAX: u16 = 1023;
 const ANALOG_WRITE_MAX: u16 = 255;
 
-async fn handle(mut rx: mpsc::UnboundedReceiver<QueueAction>, stream: SerialStream) -> io::Result<()>
+fn handle(
+    entry: hash_map::VacantEntry<'_, String, SerialHandlerConnection>,
+    stream: SerialStream)
+    -> impl Future<Output = ()> + Send + 'static
 {
-    let mut stream = BufWriter::new(BufReader::new(stream));
+    const RETRY_DELAY: Duration = Duration::from_millis(500);
+    const EXPECTED_BEAD_VERSION: u16 = 1;
 
-    let config = loop
+    let (rx_stream, tx_stream) = tokio::io::split(stream);
+    let mut rx_stream = BufReader::new(rx_stream);
+    let mut tx_stream = BufWriter::new(tx_stream);
+
+    let (tx_close, rx_close) = watch::channel(false);
+    let (tx_ping, mut rx_ping) = watch::channel(());
+    let (tx_ping_result, rx_ping_result) = watch::channel(());
+    let (tx_state, rx_state) = watch::channel(SerialHandlerConnectionState::WaitingConfig);
+
+    entry.insert(SerialHandlerConnection
     {
-        match timeout(
-            Duration::from_secs_f32(0.5),
-            incoming::Packet::read_from(&mut stream)).await
-        {
-            Ok(Ok(incoming::Packet::Config(x))) => break x,
-            Ok(Err(packet::Error::IO(x))) => return Err(x),
-            Ok(Err(packet::Error::Reset(_))) => continue,
-            _ =>
-            {
-                outgoing::Packet::WholeConfig.write_to(&mut stream).await?;
-                stream.flush().await?;
-            },
-        }
-    };
+        closed: rx_close,
+        ping: tx_ping,
+        ping_result: rx_ping_result,
+        state: rx_state,
+    });
 
-    while let Some(recv) = rx.recv().await
+    async fn send_to(writer: &mut (impl AsyncWrite + Unpin), value: impl Serialize) -> io::Result<()>
     {
-        match recv
-        {
-            QueueAction::Ping { complete } =>
-            {
-                outgoing::Packet::Ping.write_to(&mut stream).await?;
-                stream.flush().await?;
-
-                _ = complete.send(loop
-                {
-                    match timeout(
-                        Duration::from_secs_f32(0.5),
-                        incoming::Packet::read_from(&mut stream)).await
-                    {
-                        Ok(Ok(incoming::Packet::Pong)) => break Ok(()),
-                        Ok(Err(packet::Error::Reset(_))) => continue,
-                        Ok(Err(packet::Error::IO(x))) => match x.kind()
-                        {
-                            ErrorKind::UnexpectedEof => break Err(BeadClosed.into()),
-                            _ => return Err(x),
-                        },
-                        _ =>
-                        {
-                            outgoing::Packet::Ping.write_to(&mut stream).await?;
-                            stream.flush().await?;
-                        },
-                    }
-                });
-            },
-            QueueAction::GetPinPower { pin_name, complete } =>
-            {
-                if let Some(pin) = config.pins.iter().position(|pin| pin.name == pin_name)
-                {
-                    let pin = pin as u8;
-
-                    outgoing::Packet::GetPinPower { pin }.write_to(&mut stream).await?;
-                    stream.flush().await?;
-
-                    _ = complete.send(loop
-                    {
-                        match timeout(
-                            Duration::from_secs_f32(0.5),
-                            incoming::Packet::read_from(&mut stream)).await
-                        {
-                            Ok(Ok(incoming::Packet::GetPinPowerResponse { pin: response_pin, power }))
-                            if response_pin == pin => break Ok(power.min(ANALOG_READ_MAX) as f32 / ANALOG_READ_MAX as f32),
-                            Ok(Err(packet::Error::Reset(_))) => continue,
-                            Ok(Err(packet::Error::IO(x))) => match x.kind()
-                            {
-                                ErrorKind::UnexpectedEof => break Err(BeadClosed.into()),
-                                _ => return Err(x),
-                            },
-                            _ =>
-                            {
-                                outgoing::Packet::GetPinPower { pin }.write_to(&mut stream).await?;
-                                stream.flush().await?;
-                            },
-                        }
-                    });
-                }
-                else
-                {
-                    _ = complete.send(Err(GetPinPowerError::InvalidBeadPinName));
-                }
-            },
-            QueueAction::GetPinMode { pin_name, complete } =>
-            {
-                if let Some(pin) = config.pins.iter().position(|pin| pin.name == pin_name)
-                {
-                    let pin = pin as u8;
-
-                    outgoing::Packet::GetPinMode { pin }.write_to(&mut stream).await?;
-                    stream.flush().await?;
-
-                    _ = complete.send(loop
-                    {
-                        match timeout(
-                            Duration::from_secs_f32(0.5),
-                            incoming::Packet::read_from(&mut stream)).await
-                        {
-                            Ok(Ok(incoming::Packet::GetPinModeResponse { pin: response_pin, mode }))
-                            if response_pin == pin => break Ok(mode),
-                            Ok(Err(packet::Error::Reset(_))) => continue,
-                            Ok(Err(packet::Error::IO(x))) => match x.kind()
-                            {
-                                ErrorKind::UnexpectedEof => break Err(BeadClosed.into()),
-                                _ => return Err(x),
-                            },
-                            _ =>
-                            {
-                                outgoing::Packet::GetPinMode { pin }.write_to(&mut stream).await?;
-                                stream.flush().await?;
-                            },
-                        }
-                    });
-                }
-                else
-                {
-                    _ = complete.send(Err(GetPinModeError::InvalidBeadPinName));
-                }
-            },
-            QueueAction::SetPinPower { pin_name, power, complete } =>
-            {
-                if let Some(pin) = config.pins.iter().position(|pin| pin.name == pin_name)
-                {
-                    let pin = pin as u8;
-                    let power = ((power * (ANALOG_WRITE_MAX as f32 + 1.0)).floor() as u16).min(ANALOG_WRITE_MAX);
-
-                    outgoing::Packet::SetPinPower { pin, power }.write_to(&mut stream).await?;
-                    stream.flush().await?;
-
-                    _ = complete.send(loop
-                    {
-                        match timeout(
-                            Duration::from_secs_f32(0.5),
-                            incoming::Packet::read_from(&mut stream)).await
-                        {
-                            Ok(Ok(incoming::Packet::SetPinPowerResponse { pin: response_pin }))
-                            if response_pin == pin => break Ok(()),
-                            Ok(Err(packet::Error::Reset(_))) => continue,
-                            Ok(Err(packet::Error::IO(x))) => match x.kind()
-                            {
-                                ErrorKind::UnexpectedEof => break Err(BeadClosed.into()),
-                                _ => return Err(x),
-                            },
-                            _ =>
-                            {
-                                outgoing::Packet::SetPinPower { pin, power }.write_to(&mut stream).await?;
-                                stream.flush().await?;
-                            },
-                        }
-                    });
-                }
-                else
-                {
-                    _ = complete.send(Err(SetPinPowerError::InvalidBeadPinName));
-                }
-            },
-            QueueAction::SetPinMode { pin_name, mode, complete } =>
-            {
-                if let Some(pin) = config.pins.iter().position(|pin| pin.name == pin_name)
-                {
-                    let pin = pin as u8;
-
-                    outgoing::Packet::SetPinMode { pin, mode }.write_to(&mut stream).await?;
-                    stream.flush().await?;
-
-                    _ = complete.send(loop
-                    {
-                        match timeout(
-                            Duration::from_secs_f32(0.5),
-                            incoming::Packet::read_from(&mut stream)).await
-                        {
-                            Ok(Ok(incoming::Packet::SetPinModeResponse { pin: response_pin }))
-                            if response_pin == pin => break Ok(()),
-                            Ok(Err(packet::Error::Reset(_))) => continue,
-                            Ok(Err(packet::Error::IO(x))) => match x.kind()
-                            {
-                                ErrorKind::UnexpectedEof => break Err(BeadClosed.into()),
-                                _ => return Err(x),
-                            },
-                            _ =>
-                            {
-                                outgoing::Packet::SetPinMode { pin, mode }.write_to(&mut stream).await?;
-                                stream.flush().await?;
-                            },
-                        }
-                    });
-                }
-                else
-                {
-                    _ = complete.send(Err(SetPinModeError::InvalidBeadPinName));
-                }
-            },
-        }
+        value.write_to(writer).await?;
+        writer.flush().await
     }
 
-    Ok(())
+    async move
+    {
+        'and_close:
+        {
+            let config = loop
+            {
+                match timeout(RETRY_DELAY, incoming::Packet::read_from(&mut rx_stream)).await
+                {
+                    Ok(Ok(incoming::Packet::Config(x @ Config { version, .. }))) =>
+                    {
+                        if version == EXPECTED_BEAD_VERSION
+                        {
+                            break x;
+                        }
+                        else
+                        {
+                            eprintln!("{Error} Failed to read config of bead: \
+                                Unsupported version, expected '{EXPECTED_BEAD_VERSION}' got '{version}'.");
+                            break 'and_close;
+                        }
+                    },
+                    Ok(Err(packet::Error::Reset(_))) =>
+                    {
+                        continue;
+                    },
+                    Ok(Err(packet::Error::InvalidEscape { byte })) =>
+                    {
+                        eprintln!("{Warn} Bead before config sent invalid escape byte '0x{byte:0<2X}'.");
+                    },
+                    Ok(Err(packet::Error::Other(_))) =>
+                    {
+                        eprintln!("{Warn} Bead before config sent malformed packet.");
+                    },
+                    Ok(Err(packet::Error::IO(x))) =>
+                    {
+                        eprintln!("{Error} Failed to read config of bead: {x}.");
+                        break 'and_close;
+                    },
+                    _ =>
+                    {
+                        if let Err(x) = send_to(&mut tx_stream, outgoing::Packet::WholeConfig).await
+                        {
+                            eprintln!("{Error} Failed to poll config of bead: {x}.");
+                            break 'and_close;
+                        }
+                    },
+                }
+            };
+
+            #[derive(Debug)]
+            struct PinInterface
+            {
+                get_power: watch::Receiver<()>,
+                get_power_result: watch::Sender<u16>,
+                waiting_get_power: bool,
+                get_mode: watch::Receiver<()>,
+                get_mode_result: watch::Sender<PinMode>,
+                waiting_get_mode: bool,
+                set_power: watch::Receiver<u16>,
+                set_power_result: watch::Sender<Result<u16, SetPinPowerError>>,
+                waiting_set_power: bool,
+                set_mode: watch::Receiver<PinMode>,
+                set_mode_result: watch::Sender<Result<PinMode, SetPinModeError>>,
+                waiting_set_mode: bool,
+                listen_result: watch::Sender<u16>,
+            }
+
+            let (mut pin_interfaces, pins): (Vec<_>, Vec<_>) = config.pins.into_iter()
+                .map(|pin|
+                {
+                    let (tx_get_power, rx_get_power) = watch::channel(());
+                    let (tx_get_power_result, rx_get_power_result) = watch::channel(0);
+                    let (tx_get_mode, rx_get_mode) = watch::channel(());
+                    let (tx_get_mode_result, rx_get_mode_result) = watch::channel(PinMode::DigitalInput);
+                    let (tx_set_power, rx_set_power) = watch::channel(0);
+                    let (tx_set_power_result, rx_set_power_result) = watch::channel(Ok(0));
+                    let (tx_set_mode, rx_set_mode) = watch::channel(PinMode::DigitalInput);
+                    let (tx_set_mode_result, rx_set_mode_result) = watch::channel(Ok(PinMode::DigitalInput));
+                    let (tx_listen_result, rx_listen_result) = watch::channel(0);
+
+                    (
+                        PinInterface
+                        {
+                            get_power: rx_get_power,
+                            get_power_result: tx_get_power_result,
+                            waiting_get_power: false,
+                            get_mode: rx_get_mode,
+                            get_mode_result: tx_get_mode_result,
+                            waiting_get_mode: false,
+                            set_power: rx_set_power,
+                            set_power_result: tx_set_power_result,
+                            waiting_set_power: false,
+                            set_mode: rx_set_mode,
+                            set_mode_result: tx_set_mode_result,
+                            waiting_set_mode: false,
+                            listen_result: tx_listen_result,
+                        },
+                        (
+                            pin.name,
+                            SerialHandlerPinConnection
+                            {
+                                flags: pin.flags,
+                                get_power: tx_get_power,
+                                get_power_result: rx_get_power_result,
+                                get_mode: tx_get_mode,
+                                get_mode_result: rx_get_mode_result,
+                                set_power: tx_set_power,
+                                set_power_result: rx_set_power_result,
+                                set_mode: tx_set_mode,
+                                set_mode_result: rx_set_mode_result,
+                                listen_result: rx_listen_result,
+                            }))
+                })
+                .unzip();
+
+            let name = config.name;
+
+            tx_state.send_modify(|x| *x = SerialHandlerConnectionState::Active
+            {
+                name: name.clone(),
+                pins,
+            });
+
+            let mut deserializer_value = incoming::Packet::read_from(&mut rx_stream);
+            let mut deserializer = unsafe { Pin::new_unchecked(&mut deserializer_value) };
+
+            let mut waiting_for_pong = false;
+
+            loop
+            {
+                fn poll_many<F>(source: &mut PinEach<Vec<F>>)
+                    -> impl use<'_, F> + FnMut(&mut Context<'_>) -> Poll<(usize, F::Output)>
+                where
+                    F: Future,
+                {
+                    move |cx|
+                    {
+                        for (i, wait) in source.iter_pin_mut().enumerate()
+                        {
+                            if let Poll::Ready(x) = wait.poll(cx) { return Poll::Ready((i, x)) };
+                        }
+
+                        Poll::Pending
+                    }
+                }
+
+                async fn ok_or_never<F, T, E>(f: F) -> T
+                where
+                    F: IntoFuture<Output = Result<T, E>>,
+                {
+                    if let Ok(x) = f.await { return x };
+                    pending().await
+                }
+
+                async fn wait_ok_or_timeout<T: Clone>(
+                    value: &mut watch::Receiver<T>,
+                    do_timeout: bool) -> T
+                {
+                    match match do_timeout
+                    {
+                        false => Ok(value.changed().await),
+                        true => timeout(RETRY_DELAY, value.changed()).await,
+                    }
+                    {
+                        Err(_) | Ok(Ok(_)) => return value.borrow().clone(),
+                        Ok(Err(_)) => (),
+                    }
+
+                    pending().await
+                }
+
+                let mut get_power_waits = Vec::new();
+                let mut get_mode_waits = Vec::new();
+                let mut set_power_waits = Vec::new();
+                let mut set_mode_waits = Vec::new();
+
+                for PinInterface
+                {
+                    get_power, waiting_get_power,
+                    get_mode, waiting_get_mode,
+                    set_power, waiting_set_power,
+                    set_mode, waiting_set_mode,
+                    ..
+                }
+                in pin_interfaces.iter_mut()
+                {
+                    get_power_waits.push(wait_ok_or_timeout(get_power, *waiting_get_power));
+                    get_mode_waits.push(wait_ok_or_timeout(get_mode, *waiting_get_mode));
+                    set_power_waits.push(wait_ok_or_timeout(set_power, *waiting_set_power));
+                    set_mode_waits.push(wait_ok_or_timeout(set_mode, *waiting_set_mode));
+                }
+
+                let mut get_power_waits = PinEach::from(get_power_waits);
+                let mut get_mode_waits = PinEach::from(get_mode_waits);
+                let mut set_power_waits = PinEach::from(set_power_waits);
+                let mut set_mode_waits = PinEach::from(set_mode_waits);
+
+                select!
+                {
+                    biased;
+
+                    packet = poll_fn(|cx| deserializer.as_mut().poll(cx)) =>
+                    {
+                        drop(deserializer_value);
+                        deserializer_value = incoming::Packet::read_from(&mut rx_stream);
+                        deserializer = unsafe { Pin::new_unchecked(&mut deserializer_value) };
+
+                        drop((get_power_waits, get_mode_waits, set_power_waits, set_mode_waits));
+
+                        match packet
+                        {
+                            Ok(incoming::Packet::Pong) =>
+                            {
+                                tx_ping_result.send_modify(|x| *x = ());
+                            },
+                            Ok(incoming::Packet::Config(_)) =>
+                            {
+                                eprintln!("{Warn} Bead sent second config.");
+                            },
+                            Ok(incoming::Packet::GetPinPowerResponse { pin, power }) =>
+                            {
+                                if pin as usize > pin_interfaces.len()
+                                {
+                                    eprintln!("{Warn} Bead '{name}' send invalid pin '0x{pin:0<2X}'.");
+                                }
+                                else
+                                {
+                                    let pin = &mut pin_interfaces[pin as usize];
+                                    pin.get_power_result.send_modify(|x| *x = power);
+                                    pin.waiting_get_power = false;
+                                }
+                            },
+                            Ok(incoming::Packet::GetPinModeResponse { pin, mode }) =>
+                            {
+                                if pin as usize > pin_interfaces.len()
+                                {
+                                    eprintln!("{Warn} Bead '{name}' send invalid pin '0x{pin:0<2X}'.");
+                                }
+                                else
+                                {
+                                    let pin = &mut pin_interfaces[pin as usize];
+                                    pin.get_mode_result.send_modify(|x| *x = mode);
+                                    pin.waiting_get_power = false;
+                                }
+                            },
+                            Ok(incoming::Packet::SetPinPowerResponse { pin, power }) =>
+                            {
+                                if pin as usize > pin_interfaces.len()
+                                {
+                                    eprintln!("{Warn} Bead '{name}' send invalid pin '0x{pin:0<2X}'.");
+                                }
+                                else
+                                {
+                                    let pin = &mut pin_interfaces[pin as usize];
+                                    pin.set_power_result.send_modify(|x| *x = Ok(power));
+                                    pin.waiting_get_power = false;
+                                }
+                            },
+                            Ok(incoming::Packet::SetPinModeResponse { pin, mode }) =>
+                            {
+                                if pin as usize > pin_interfaces.len()
+                                {
+                                    eprintln!("{Warn} Bead '{name}' send invalid pin '0x{pin:0<2X}'.");
+                                }
+                                else
+                                {
+                                    let pin = &mut pin_interfaces[pin as usize];
+                                    pin.set_mode_result.send_modify(|x| *x = Ok(mode));
+                                    pin.waiting_get_power = false;
+                                }
+                            },
+                            Ok(incoming::Packet::PinListen { pin, power }) =>
+                            {
+                                if pin as usize > pin_interfaces.len()
+                                {
+                                    eprintln!("{Warn} Bead '{name}' send invalid pin '0x{pin:0<2X}'.");
+                                }
+                                else
+                                {
+                                    let pin = &mut pin_interfaces[pin as usize];
+                                    pin.listen_result.send_modify(|x| *x = power);
+                                    pin.waiting_get_power = false;
+                                }
+                            },
+                            Ok(incoming::Packet::InvalidPinMode { byte }) =>
+                            {
+                                eprintln!("{Warn} Bead '{name}' reported invalid pin mode '0x{byte:0<2X}'.");
+                            },
+                            Ok(incoming::Packet::InvalidPinId { byte }) =>
+                            {
+                                eprintln!("{Warn} Bead '{name}' reported invalid pin id '0x{byte:0<2X}'.");
+                            },
+                            Ok(incoming::Packet::InvalidPacketId { byte }) =>
+                            {
+                                eprintln!("{Warn} Bead '{name}' reported invalid packet id '0x{byte:0<2X}'.");
+                            },
+                            Ok(incoming::Packet::InvalidWriteToInput { pin, power }) =>
+                            {
+                                if pin as usize > pin_interfaces.len()
+                                {
+                                    eprintln!("{Warn} Bead '{name}' send invalid pin '0x{pin:0<2X}'.");
+                                }
+                                else
+                                {
+                                    let pin = &mut pin_interfaces[pin as usize];
+                                    pin.set_power_result.send_modify(|x| *x = Err(SetPinPowerError::InvalidWriteToInput { power }));
+                                    pin.waiting_get_power = false;
+                                }
+                            },
+                            Ok(incoming::Packet::InvalidUnsupportedMode { pin, mode }) =>
+                            {
+                                if pin as usize > pin_interfaces.len()
+                                {
+                                    eprintln!("{Warn} Bead '{name}' send invalid pin '0x{pin:0<2X}'.");
+                                }
+                                else
+                                {
+                                    let pin = &mut pin_interfaces[pin as usize];
+                                    pin.set_mode_result.send_modify(|x| *x = Err(SetPinModeError::InvalidUnsupportedMode { mode }));
+                                    pin.waiting_get_power = false;
+                                }
+                            },
+                            Ok(incoming::Packet::InvalidEscape { byte }) =>
+                            {
+                                eprintln!("{Warn} Bead '{name}' reported invalid escape byte '0x{byte:0<2X}'.");
+                            },
+                            Err(packet::Error::Reset(_)) =>
+                            {
+                                continue;
+                            },
+                            Err(packet::Error::InvalidEscape { byte }) =>
+                            {
+                                eprintln!("{Warn} Bead '{name}' sent invalid escape byte '0x{byte:0<2X}'.");
+                            },
+                            Err(packet::Error::Other(_)) =>
+                            {
+                                eprintln!("{Warn} Bead '{name}' sent malformed packet.");
+                            },
+                            Err(packet::Error::IO(x)) =>
+                            {
+                                match x.kind()
+                                {
+                                    io::ErrorKind::UnexpectedEof =>
+                                    {
+                                        break 'and_close;
+                                    },
+                                    _ =>
+                                    {
+                                        eprintln!("{Error} Failed to read config of bead: {x}.");
+                                        break 'and_close;
+                                    },
+                                }
+                            },
+                        }
+                    },
+                    () = wait_ok_or_timeout(&mut rx_ping, waiting_for_pong) =>
+                    {
+                        drop((get_power_waits, get_mode_waits, set_power_waits, set_mode_waits));
+
+                        waiting_for_pong = true;
+                        if let Err(x) = send_to(
+                            &mut tx_stream,
+                            outgoing::Packet::Ping).await
+                        {
+                            eprintln!("{Error} Failed to send packet to bead: {x}.");
+                            break 'and_close;
+                        }
+                    },
+                    (pin, ()) = poll_fn(poll_many(&mut get_power_waits)) =>
+                    {
+                        drop((get_power_waits, get_mode_waits, set_power_waits, set_mode_waits));
+
+                        pin_interfaces[pin as usize].waiting_get_power = true;
+                        if let Err(x) = send_to(
+                            &mut tx_stream,
+                            outgoing::Packet::GetPinPower { pin: pin as u8 }).await
+                        {
+                            eprintln!("{Error} Failed to send packet to bead: {x}.");
+                            break 'and_close;
+                        }
+                    },
+                    (pin, ()) = poll_fn(poll_many(&mut get_mode_waits)) =>
+                    {
+                        drop((get_power_waits, get_mode_waits, set_power_waits, set_mode_waits));
+
+                        pin_interfaces[pin as usize].waiting_get_mode = true;
+                        if let Err(x) = send_to(
+                            &mut tx_stream,
+                            outgoing::Packet::GetPinMode { pin: pin as u8 }).await
+                        {
+                            eprintln!("{Error} Failed to send packet to bead: {x}.");
+                            break 'and_close;
+                        }
+                    },
+                    (pin, power) = poll_fn(poll_many(&mut set_power_waits)) =>
+                    {
+                        drop((get_power_waits, get_mode_waits, set_power_waits, set_mode_waits));
+
+                        pin_interfaces[pin as usize].waiting_set_power = true;
+                        if let Err(x) = send_to(
+                            &mut tx_stream,
+                            outgoing::Packet::SetPinPower { pin: pin as u8, power }).await
+                        {
+                            eprintln!("{Error} Failed to send packet to bead: {x}.");
+                            break 'and_close;
+                        }
+                    },
+                    (pin, mode) = poll_fn(poll_many(&mut set_mode_waits)) =>
+                    {
+                        drop((get_power_waits, get_mode_waits, set_power_waits, set_mode_waits));
+
+                        pin_interfaces[pin as usize].waiting_set_mode = true;
+                        if let Err(x) = send_to(
+                            &mut tx_stream,
+                            outgoing::Packet::SetPinMode { pin: pin as u8, mode }).await
+                        {
+                            eprintln!("{Error} Failed to send packet to bead: {x}.");
+                            break 'and_close;
+                        }
+                    },
+                }
+            }
+        }
+
+        tx_close.send_modify(|x| *x = true);
+    }
 }

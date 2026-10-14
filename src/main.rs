@@ -12,15 +12,29 @@
 // use tokio::net::{TcpListener, UdpSocket};
 // use tokio::sync::OnceCell;
 
-use config::{Configuration, read_config};
-use tokio::io;
+use broadcaster::Broadcaster;
+use tokio::time::interval;
+use tokio::{io, signal};
+use tokio::net::{TcpListener, UdpSocket};
 
+use std::convert::Infallible;
 use std::env;
 use std::ffi::OsString;
+use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
+use std::ops::ControlFlow;
+use std::time::Duration;
 
 mod args;
 
 mod config;
+
+mod packet;
+
+mod bead;
+
+mod router;
+
+mod broadcaster;
 
 mod log;
 use log::*;
@@ -32,7 +46,7 @@ async fn main()
     {
         Ok(Some(args::Command::Run { listen_port, broadcast_port, berry_name })) =>
         {
-            let config = match read_config(&env::current_dir().unwrap()).await
+            let config = match config::read_config(&env::current_dir().unwrap()).await
             {
                 Ok(x) => x,
                 Err(errors) =>
@@ -41,7 +55,7 @@ async fn main()
                         error,
                         config::ReadError::Io(error) if error.kind() == io::ErrorKind::NotFound))
                     {
-                        Configuration::default()
+                        config::Configuration::default()
                     }
                     else if errors.iter().any(|(_, error)| matches!(
                         error,
@@ -68,9 +82,71 @@ async fn main()
                 },
             };
 
-            let listen_port = listen_port.or(config.listen_port);
-            let broadcast_port = broadcast_port.or(config.broadcast_port);
+            let listen_port = listen_port.or(config.listen_port).unwrap_or(0);
+            let broadcast_port = broadcast_port.or(config.broadcast_port).unwrap_or(0);
             let berry_name = berry_name.or(config.berry_name);
+
+            let local_broadcast_ip = local_ip_address::local_broadcast_ip().unwrap();
+            let local_ip = local_ip_address::local_ip().unwrap();
+
+            let listener = match TcpListener::bind(SocketAddrV4::new(
+                Ipv4Addr::new(0, 0, 0, 0),
+                listen_port)).await
+            {
+                Ok(x) => x,
+                Err(error) =>
+                {
+                    eprintln!("{Error} Failed to start listener on port {listen_port}: {error}.");
+                    return;
+                },
+            };
+
+            eprintln!("{Success} Started listening on {}.", listener.local_addr().unwrap());
+
+            let broadcaster = match UdpSocket::bind(SocketAddrV4::new(
+                Ipv4Addr::new(0, 0, 0, 0),
+                0)).await
+            {
+                Ok(x) => x,
+                Err(error) =>
+                {
+                    eprintln!("{Error} Failed to start broadcaster: {error}.");
+                    return;
+                },
+            };
+
+            broadcaster.set_broadcast(true).unwrap();
+
+            match broadcaster.connect(SocketAddr::new(
+                local_broadcast_ip,
+                broadcast_port)).await
+            {
+                Ok(x) => x,
+                Err(error) =>
+                {
+                    eprintln!("{Error} Failed to connect broadcaster on port {broadcast_port}: {error}.");
+                    return;
+                },
+            }
+
+            eprintln!("{Success} Started broadcasting to {}.", broadcaster.peer_addr().unwrap());
+
+            tokio::spawn(Broadcaster
+            {
+                socket: broadcaster,
+                message: Vec::from(match berry_name
+                {
+                    Some(x) => format!("[Hellberry {x}:{local_ip}]"),
+                    None => format!("[Hellberry:{local_ip}]"),
+                }),
+                interval: interval(Duration::from_secs_f32(1.0)),
+                on_error: async |error|
+                {
+                    eprintln!("{Warn} Failed to broadcast: {error}.");
+                    ControlFlow::Continue::<Infallible>(())
+                }
+            }
+                .run());
         },
         Ok(Some(args::Command::Help) | None) =>
         {
@@ -308,25 +384,25 @@ A config file at \'./config.json\' or \'./config.yaml\' can be used to specify m
 //     }
 // }
 
-// async fn shutdown_signal()
-// {
-//     let ctrl_c = async
-//     {
-//         signal::ctrl_c().await.unwrap();
-//     };
+async fn shutdown_signal()
+{
+    let ctrl_c = async
+    {
+        signal::ctrl_c().await.unwrap();
+    };
 
-//     #[cfg(unix)]
-//     let terminate = async
-//     {
-//         signal::unix::signal(signal::unix::SignalKind::terminate()).unwrap().recv().await;
-//     };
+    #[cfg(unix)]
+    let terminate = async
+    {
+        signal::unix::signal(signal::unix::SignalKind::terminate()).unwrap().recv().await;
+    };
 
-//     #[cfg(not(unix))]
-//     let terminate = std::future::pending();
+    #[cfg(not(unix))]
+    let terminate = std::future::pending();
 
-//     tokio::select!
-//     {
-//         _ = ctrl_c => (),
-//         _ = terminate => (),
-//     }
-// }
+    tokio::select!
+    {
+        _ = ctrl_c => (),
+        _ = terminate => (),
+    }
+}
