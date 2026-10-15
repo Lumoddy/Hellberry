@@ -10,13 +10,13 @@ pub enum Packet
     Config(Config),
     GetPinPowerResponse { pin: u8, power: u16 },
     GetPinModeResponse { pin: u8, mode: PinMode },
-    SetPinPowerResponse { pin: u8, power: u16 },
+    SetPinPowerResponse { pin: u8, power: u8 },
     SetPinModeResponse { pin: u8, mode: PinMode },
     PinListen { pin: u8, power: u16 },
     InvalidPinMode { byte: u8 },
     InvalidPinId { byte: u8 },
     InvalidPacketId { byte: u8 },
-    InvalidWriteToInput { pin: u8, power: u16 },
+    InvalidWriteToInput { pin: u8, power: u8 },
     InvalidUnsupportedMode { pin: u8, mode: PinMode },
     InvalidEscape { byte: u8 },
 }
@@ -44,7 +44,7 @@ impl Deserialize for Packet
             4 => Ok(Packet::SetPinPowerResponse
             {
                 pin: u8::read_from(reader).await.map_err(packet::Error::upcast)?,
-                power: u16::read_from(reader).await.map_err(packet::Error::upcast)?,
+                power: u8::read_from(reader).await.map_err(packet::Error::upcast)?,
             }),
             5 => Ok(Packet::SetPinModeResponse
             {
@@ -67,7 +67,7 @@ impl Deserialize for Packet
             103 => Ok(Packet::InvalidWriteToInput
             {
                 pin: u8::read_from(reader).await.map_err(packet::Error::upcast)?,
-                power: u16::read_from(reader).await.map_err(packet::Error::upcast)?,
+                power: u8::read_from(reader).await.map_err(packet::Error::upcast)?,
             }),
             104 => Ok(Packet::InvalidUnsupportedMode
             {

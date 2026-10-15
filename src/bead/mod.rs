@@ -9,13 +9,13 @@ use tokio::io::{AsyncRead, AsyncWrite};
 #[derive(Clone, Debug)]
 pub enum InvalidPinModeOrUTF8
 {
-    InvalidPinMode { byte: u8 },
-    InvalidUTF8 { error: string::FromUtf8Error },
+    InvalidPinMode,
+    InvalidUTF8,
 }
 
 impl From<string::FromUtf8Error> for InvalidPinModeOrUTF8
 {
-    fn from(error: string::FromUtf8Error) -> Self { Self::InvalidUTF8 { error } }
+    fn from(_: string::FromUtf8Error) -> Self { Self::InvalidUTF8 }
 }
 
 pub mod packet;
@@ -216,7 +216,7 @@ impl Deserialize for PinMode
             2 => Ok(Self::DigitalOutput),
             3 => Ok(Self::AnalogInput),
             4 => Ok(Self::AnalogOutput),
-            byte => Err(crate::packet::Error::Other(InvalidPinModeOrUTF8::InvalidPinMode { byte })),
+            _ => Err(crate::packet::Error::Other(InvalidPinModeOrUTF8::InvalidPinMode)),
         }
     }
 }
@@ -254,9 +254,9 @@ impl Deserialize for ConfigPin
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Config
 {
-    version: u16,
-    name: String,
-    pins: Vec<ConfigPin>,
+    pub version: u16,
+    pub name: String,
+    pub pins: Vec<ConfigPin>,
 }
 
 impl Serialize for Config

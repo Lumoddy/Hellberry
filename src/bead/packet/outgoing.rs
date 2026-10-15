@@ -10,7 +10,7 @@ pub enum Packet
     WholeConfig,
     GetPinPower { pin: u8 },
     GetPinMode { pin: u8 },
-    SetPinPower { pin: u8, power: u16 },
+    SetPinPower { pin: u8, power: u8 },
     SetPinMode { pin: u8, mode: PinMode },
 }
 

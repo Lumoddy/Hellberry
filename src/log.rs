@@ -1,14 +1,5 @@
 use std::fmt;
 
-#[derive(Clone, Copy, Debug, Hash, PartialEq, Eq, PartialOrd, Ord)]
-pub enum Logging
-{
-    None,
-    Error,
-    Warn,
-    All,
-}
-
 macro_rules! impl_as_str
 {
     ( $( $name:ident = $str:expr ),* $(,)? ) =>

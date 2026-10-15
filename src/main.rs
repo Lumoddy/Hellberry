@@ -12,7 +12,10 @@
 // use tokio::net::{TcpListener, UdpSocket};
 // use tokio::sync::OnceCell;
 
+use axum::routing;
+use bead::serial_handler::SerialHandler;
 use broadcaster::Broadcaster;
+use router::Router;
 use tokio::time::interval;
 use tokio::{io, signal};
 use tokio::net::{TcpListener, UdpSocket};
@@ -134,9 +137,9 @@ async fn main()
             tokio::spawn(Broadcaster
             {
                 socket: broadcaster,
-                message: Vec::from(match berry_name
+                message: Vec::from(match &berry_name
                 {
-                    Some(x) => format!("[Hellberry {x}:{local_ip}]"),
+                    Some(name) => format!("[Hellberry {name}:{local_ip}]"),
                     None => format!("[Hellberry:{local_ip}]"),
                 }),
                 interval: interval(Duration::from_secs_f32(1.0)),
@@ -147,6 +150,18 @@ async fn main()
                 }
             }
                 .run());
+
+            axum::serve(
+                listener,
+                routing::Router::from(Router
+                {
+                    config_name: berry_name,
+                    logo_path: config.logo_path,
+                    simple_logo_path: config.simple_logo_path,
+                    serial_handler: SerialHandler::new().into(),
+                }))
+                .await
+                .unwrap();
         },
         Ok(Some(args::Command::Help) | None) =>
         {
@@ -177,212 +192,6 @@ A config file at \'./config.json\' or \'./config.yaml\' can be used to specify m
   {ANSIPurple}\"broadcast-port\"{ANSIReset} The port to broadcast to on the local network.
 ");
 }
-
-// mod packet;
-
-// mod bead;
-
-// mod router;
-
-// mod config;
-
-// mod log;
-// use log::*;
-
-// static CURRENT_DIR: OnceCell<PathBuf> = OnceCell::const_new();
-// static CONFIG: OnceCell<Configuration> = OnceCell::const_new();
-// static SERIAL_HANDLER: OnceCell<SerialHandler> = OnceCell::const_new();
-
-// #[tokio::main]
-// async fn main()
-// {
-//     let mut args = env::args_os();
-
-//     _ = args.next();
-
-//     match args.next().as_ref().map(|x| x.as_encoded_bytes())
-//     {
-//         Some(b"run") =>
-//         {
-//             let mut listen_port = None;
-//             let mut broadcast_port = None;
-
-//             while let Some(arg) = args.next().as_ref().map(|x| x.as_encoded_bytes())
-//             {
-//                 match arg
-//                 {
-//                     b"-listen" | b"-listen-port" => match args.next()
-//                     {
-//                         Some(value) =>
-//                         {
-//                             if let Some(value) = str::from_utf8(value.as_encoded_bytes())
-//                                 .ok().and_then(|x| x.parse().ok())
-//                             {
-//                                 if listen_port.is_some()
-//                                 {
-//                                     eprintln!("{Error} Duplicate listen port.");
-//                                     return;
-//                                 }
-
-//                                 listen_port = Some(value);
-//                             }
-//                             else
-//                             {
-//                                 eprintln!("{Error} Invalid listen port value \"{:?}\".", value);
-//                                 return;
-//                             }
-//                         },
-//                         None =>
-//                         {
-//                             eprintln!("{Error} Missing value after \"-listen-port\"");
-//                             return;
-//                         },
-//                     },
-//                     b"-broadcast" | b"-broadcast-port" => match args.next()
-//                     {
-//                         Some(value) =>
-//                         {
-//                             if let Some(value) = str::from_utf8(value.as_encoded_bytes())
-//                                 .ok().and_then(|x| x.parse().ok())
-//                             {
-//                                 if broadcast_port.is_some()
-//                                 {
-//                                     eprintln!("{Error} Duplicate broadcast port.");
-//                                     return;
-//                                 }
-
-//                                 broadcast_port = Some(value);
-//                             }
-//                             else
-//                             {
-//                                 eprintln!("{Error} Invalid broadcast port value \"{:?}\".", value);
-//                                 return;
-//                             }
-//                         },
-//                         None =>
-//                         {
-//                             eprintln!("{Error} Missing value after \"-broadcast-port\"");
-//                             return;
-//                         },
-//                     },
-//                     value =>
-//                     {
-//                         eprintln!("{Error} Invalid arg \"{:?}\".", value);
-//                         return;
-//                     },
-//                 }
-//             }
-
-//             let local_broadcast_ip = local_ip_address::local_broadcast_ip().unwrap();
-//             let local_ip = local_ip_address::local_ip().unwrap();
-
-//             CURRENT_DIR.set(env::current_dir().unwrap()).unwrap();
-
-//             let config = read_config().await.unwrap_or_default();
-
-//             let listener = match TcpListener::bind(SocketAddrV4::new(
-//                 Ipv4Addr::new(0, 0, 0, 0),
-//                 listen_port.or(config.listen_port).unwrap_or(0))).await
-//             {
-//                 Ok(x) => x,
-//                 Err(error) =>
-//                 {
-//                     eprintln!("{Error} Failed to start listener: {}.", error);
-//                     return;
-//                 },
-//             };
-
-//             eprintln!("{Success} Started listener on port {}.", listener.local_addr().unwrap().port());
-
-//             let broadcaster = match UdpSocket::bind(SocketAddrV4::new(
-//                 Ipv4Addr::new(0, 0, 0, 0),
-//                 0)).await
-//             {
-//                 Ok(x) => x,
-//                 Err(error) =>
-//                 {
-//                     eprintln!("{Error} Failed to start broadcaster: {}.", error);
-//                     return;
-//                 },
-//             };
-
-//             broadcaster.set_broadcast(true).unwrap();
-
-//             if config.broadcast_port.is_none()
-//             {
-//                 eprintln!("{Error} Broadcast port is not specified.");
-//                 return;
-//             }
-
-//             match broadcaster.connect(SocketAddr::new(
-//                 local_broadcast_ip,
-//                 broadcast_port.or(config.broadcast_port).unwrap_or(0))).await
-//             {
-//                 Ok(x) => x,
-//                 Err(error) =>
-//                 {
-//                     eprintln!("{Error} Failed to connect broadcaster: {}.", error);
-//                     return;
-//                 },
-//             }
-
-//             eprintln!("{Success} Started broadcaster targeting {}.", broadcaster.peer_addr().unwrap());
-
-//             CONFIG.set(config).unwrap();
-
-//             SERIAL_HANDLER.set(SerialHandler::new()).map_err(drop).unwrap();
-
-//             tokio::spawn(async move
-//             {
-//                 while timeout(
-//                     Duration::from_secs_f32(0.5),
-//                     shutdown_signal()).await.is_err()
-//                 {
-//                     SERIAL_HANDLER.get().unwrap().update().await;
-//                 }
-//             });
-
-//             tokio::spawn(async move
-//             {
-//                 axum::serve(listener, router(&SERIAL_HANDLER.get().unwrap()))
-//                     .with_graceful_shutdown(shutdown_signal())
-//                     .await
-//             });
-
-//             tokio::spawn(async move
-//             {
-//                 let message = format!("[Hellberry:{}]", local_ip);
-
-//                 while timeout(
-//                     Duration::from_secs_f32(1.0),
-//                     shutdown_signal()).await.is_err()
-//                 {
-//                     if let Err(x) = broadcaster.send(message.as_bytes()).await
-//                     {
-//                         eprintln!("{Warn} Failed to broadcast: {}.", x);
-//                     }
-//                 }
-//             });
-//         },
-//         _ =>
-//         {
-//             eprintln!("{Success} Relays the state of the connected Hellberry Beads (usually Arduinos) through a hosted http server with websocket support.");
-//             eprintln!("");
-//             eprintln!("  {ANSICyan}run{ANSIReset} Starts the http server.");
-//             eprintln!("    {ANSIYellow}-listen -listen_port{ANSIReset} The port the http server will listen on.");
-//             eprintln!("    {ANSIYellow}-broadcast -broadcast_port{ANSIReset} The port to broadcast to on the local network.");
-//             eprintln!("");
-//             eprintln!("A config file at \'./config.json\' or \'./config.yaml\' can be used to specify more options:");
-//             eprintln!("");
-//             eprintln!("  {ANSIPurple}\"name\"{ANSIReset} The name of this Hellberry.");
-//             eprintln!("  {ANSIPurple}\"logo-path\"{ANSIReset} The relative path to a logo image.");
-//             eprintln!("  {ANSIPurple}\"simple-logo-path\"{ANSIReset} Single color version of the logo image.");
-//             eprintln!("  {ANSIPurple}\"listen-port\"{ANSIReset} The port the http server will listen on.");
-//             eprintln!("  {ANSIPurple}\"broadcast-port\"{ANSIReset} The port to broadcast to on the local network.");
-//             eprintln!("");
-//         },
-//     }
-// }
 
 async fn shutdown_signal()
 {

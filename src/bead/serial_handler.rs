@@ -1,7 +1,8 @@
+use std::borrow::Borrow;
 use std::collections::{HashMap, hash_map};
 use std::future::{pending, poll_fn};
+use std::hash::Hash;
 use std::pin::Pin;
-use std::sync::Arc;
 use std::task::{Context, Poll};
 use std::time::Duration;
 
@@ -17,7 +18,7 @@ use crate::packet;
 use crate::packet::{Deserialize, Serialize};
 use crate::log::*;
 
-use super::{Config, PinFlags, PinMode};
+use super::{Config, ConfigPin, PinFlags, PinMode};
 use super::packet::incoming;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -46,12 +47,12 @@ pub enum GetPinModeError
     InvalidBeadPinName,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub enum SetPinPowerError
 {
     BeadClosed,
     InvalidBeadPinName,
-    InvalidWriteToInput { power: u16 },
+    InvalidWriteToInput { power: f32 },
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -72,15 +73,15 @@ enum SerialHandlerConnectionState
         name: String,
         pins: Vec<(String, SerialHandlerPinConnection)>,
     },
+    Closed,
 }
 
 #[derive(Debug)]
 struct SerialHandlerConnection
 {
-    closed: watch::Receiver<bool>,
     ping: watch::Sender<()>,
     ping_result: watch::Receiver<()>,
-    state: watch::Receiver<SerialHandlerConnectionState>,
+    state_result: watch::Receiver<SerialHandlerConnectionState>,
 }
 
 #[derive(Debug)]
@@ -91,17 +92,20 @@ struct SerialHandlerPinConnection
     get_power_result: watch::Receiver<u16>,
     get_mode: watch::Sender<()>,
     get_mode_result: watch::Receiver<PinMode>,
-    set_power: watch::Sender<u16>,
-    set_power_result: watch::Receiver<Result<u16, SetPinPowerError>>,
+    set_power: watch::Sender<u8>,
+    set_power_result: watch::Receiver<Result<u8, SetPinPowerError>>,
     set_mode: watch::Sender<PinMode>,
     set_mode_result: watch::Receiver<Result<PinMode, SetPinModeError>>,
-    listen_result: watch::Receiver<u16>,
 }
 
 pub struct SerialHandler
 {
+    next_closed_result: watch::Sender<String>,
+    next_listen_result: watch::Sender<(String, String, f32)>,
     connected: Mutex<HashMap<String, SerialHandlerConnection>>,
 }
+
+const EXPECTED_BEAD_VERSION: u16 = 1;
 
 impl SerialHandler
 {
@@ -109,15 +113,257 @@ impl SerialHandler
     {
         Self
         {
+            next_closed_result: <_>::default(),
+            next_listen_result: <_>::default(),
             connected: Mutex::new(HashMap::new()),
         }
     }
 
-    pub async fn update(self: Arc<Self>, mut new: impl AsyncFnMut(&str))
+    pub async fn ping<B: ?Sized>(&self, bead: &B)
+        -> Option<Result<(), PingError>>
+    where
+        String: Borrow<B>,
+        B: Hash + Eq,
+    {
+        let mut ping_result =
+        {
+            let lock = self.connected.lock().await;
+
+            let Some(SerialHandlerConnection { ping, ping_result, .. }) = lock.get(bead)
+            else { return None };
+
+            _ = ping.send_replace(());
+            ping_result.clone()
+        };
+
+        match ping_result.changed().await
+        {
+            Ok(()) => Some(Ok(())),
+            Err(_) => Some(Err(PingError::BeadClosed)),
+        }
+    }
+
+    pub async fn config<B: ?Sized>(&self, bead: &B)
+        -> Option<Result<Config, WholeConfigError>>
+    where
+        String: Borrow<B>,
+        B: Hash + Eq,
+    {
+        let mut state_result =
+        {
+            let lock = self.connected.lock().await;
+
+            let Some(SerialHandlerConnection { state_result, .. }) = lock.get(bead)
+            else { return None };
+
+            state_result.clone()
+        };
+
+        let Ok(lock) = state_result.wait_for(|x| matches!(x, SerialHandlerConnectionState::Active { .. })).await
+        else { return Some(Err(WholeConfigError::BeadClosed)) };
+
+        let SerialHandlerConnectionState::Active { name, pins } = &*lock
+        else { unreachable!() };
+
+        Some(Ok(Config
+        {
+            version: EXPECTED_BEAD_VERSION,
+            name: name.clone(),
+            pins: pins.iter()
+                .map(|(name, pin)| ConfigPin { name: name.clone(), flags: pin.flags })
+                .collect(),
+        }))
+    }
+
+    pub async fn get_pin_power<B: ?Sized, P: ?Sized>(&self, bead: &B, pin: &P)
+        -> Option<Result<f32, GetPinPowerError>>
+    where
+        String: Borrow<B>,
+        B: Hash + Eq,
+        P: PartialEq<str>,
+    {
+        let mut state_result =
+        {
+            let lock = self.connected.lock().await;
+
+            let Some(SerialHandlerConnection { state_result, .. }) = lock.get(bead)
+            else { return None };
+
+            state_result.clone()
+        };
+
+        let mut get_power_result =
+        {
+            let Ok(lock) = state_result.wait_for(|x| matches!(x, SerialHandlerConnectionState::Active { .. })).await
+            else { return Some(Err(GetPinPowerError::BeadClosed)) };
+
+            let SerialHandlerConnectionState::Active { pins, .. } = &*lock
+            else { unreachable!() };
+
+            let Some(pin) = pins.iter().position(|(name, _)| *pin == *name.as_str())
+            else { return Some(Err(GetPinPowerError::InvalidBeadPinName)) };
+
+            let SerialHandlerPinConnection { get_power, get_power_result, .. } = &pins[pin].1;
+
+            _ = get_power.send_replace(());
+            get_power_result.clone()
+        };
+
+        match get_power_result.changed().await
+        {
+            Ok(()) => Some(Ok(*watch::Receiver::borrow(&get_power_result) as f32 / ANALOG_READ_MAX as f32)),
+            Err(_) => Some(Err(GetPinPowerError::BeadClosed)),
+        }
+    }
+
+    pub async fn get_pin_mode<B: ?Sized, P: ?Sized>(&self, bead: &B, pin: &P)
+        -> Option<Result<PinMode, GetPinModeError>>
+    where
+        String: Borrow<B>,
+        B: Hash + Eq,
+        P: PartialEq<str>,
+    {
+        let mut state_result =
+        {
+            let lock = self.connected.lock().await;
+
+            let Some(SerialHandlerConnection { state_result, .. }) = lock.get(bead)
+            else { return None };
+
+            state_result.clone()
+        };
+
+        let mut get_mode_result =
+        {
+            let Ok(lock) = state_result.wait_for(|x| matches!(x, SerialHandlerConnectionState::Active { .. })).await
+            else { return Some(Err(GetPinModeError::BeadClosed)) };
+
+            let SerialHandlerConnectionState::Active { pins, .. } = &*lock
+            else { unreachable!() };
+
+            let Some(pin) = pins.iter().position(|(name, _)| *pin == *name.as_str())
+            else { return Some(Err(GetPinModeError::InvalidBeadPinName)) };
+
+            let SerialHandlerPinConnection { get_mode, get_mode_result, .. } = &pins[pin].1;
+
+            _ = get_mode.send_replace(());
+            get_mode_result.clone()
+        };
+
+        match get_mode_result.changed().await
+        {
+            Ok(()) => Some(Ok(*watch::Receiver::borrow(&get_mode_result))),
+            Err(_) => Some(Err(GetPinModeError::BeadClosed)),
+        }
+    }
+
+    pub async fn set_pin_power<B: ?Sized, P: ?Sized>(&self, bead: &B, pin: &P, power: f32)
+        -> Option<Result<f32, SetPinPowerError>>
+    where
+        String: Borrow<B>,
+        B: Hash + Eq,
+        P: PartialEq<str>,
+    {
+        let mut state_result =
+        {
+            let lock = self.connected.lock().await;
+
+            let Some(SerialHandlerConnection { state_result, .. }) = lock.get(bead)
+            else { return None };
+
+            state_result.clone()
+        };
+
+        let mut set_power_result =
+        {
+            let Ok(lock) = state_result.wait_for(|x| matches!(x, SerialHandlerConnectionState::Active { .. })).await
+            else { return Some(Err(SetPinPowerError::BeadClosed)) };
+
+            let SerialHandlerConnectionState::Active { pins, .. } = &*lock
+            else { unreachable!() };
+
+            let Some(pin) = pins.iter().position(|(name, _)| *pin == *name.as_str())
+            else { return Some(Err(SetPinPowerError::InvalidBeadPinName)) };
+
+            let SerialHandlerPinConnection { set_power, set_power_result, .. } = &pins[pin].1;
+
+            _ = set_power.send_replace((power.clamp(0.0, 1.0) * ANALOG_WRITE_MAX as f32) as u8);
+            set_power_result.clone()
+        };
+
+        match set_power_result.changed().await
+        {
+            Ok(()) => Some((*watch::Receiver::borrow(&set_power_result)).map(|x| x as f32 / ANALOG_WRITE_MAX as f32)),
+            Err(_) => Some(Err(SetPinPowerError::BeadClosed)),
+        }
+    }
+
+    pub async fn set_pin_mode<B: ?Sized, P: ?Sized>(&self, bead: &B, pin: &P, mode: PinMode)
+        -> Option<Result<PinMode, SetPinModeError>>
+    where
+        String: Borrow<B>,
+        B: Hash + Eq,
+        P: PartialEq<str>,
+    {
+        let mut state_result =
+        {
+            let lock = self.connected.lock().await;
+
+            let Some(SerialHandlerConnection { state_result, .. }) = lock.get(bead)
+            else { return None };
+
+            state_result.clone()
+        };
+
+        let mut set_mode_result =
+        {
+            let Ok(lock) = state_result.wait_for(|x| matches!(x, SerialHandlerConnectionState::Active { .. })).await
+            else { return Some(Err(SetPinModeError::BeadClosed)) };
+
+            let SerialHandlerConnectionState::Active { pins, .. } = &*lock
+            else { unreachable!() };
+
+            let Some(pin) = pins.iter().position(|(name, _)| *pin == *name.as_str())
+            else { return Some(Err(SetPinModeError::InvalidBeadPinName)) };
+
+            let SerialHandlerPinConnection { set_mode, set_mode_result, .. } = &pins[pin].1;
+
+            _ = set_mode.send_replace(mode);
+            set_mode_result.clone()
+        };
+
+        match set_mode_result.changed().await
+        {
+            Ok(()) => Some(*watch::Receiver::borrow(&set_mode_result)),
+            Err(_) => Some(Err(SetPinModeError::BeadClosed)),
+        }
+    }
+
+    pub async fn next_closed(&self) -> Result<String, ()>
+    {
+        let mut result = self.next_closed_result.subscribe();
+        match result.changed().await
+        {
+            Ok(()) => Ok(result.borrow().clone()),
+            Err(_) => Err(()),
+        }
+    }
+
+    pub async fn next_listen(&self) -> Result<(String, String, f32), ()>
+    {
+        let mut result = self.next_listen_result.subscribe();
+        match result.changed().await
+        {
+            Ok(()) => Ok(result.borrow().clone()),
+            Err(_) => Err(()),
+        }
+    }
+
+    pub async fn update(&self, mut new: impl FnMut(String))
     {
         let available_ports = tokio_serial::available_ports().unwrap();
 
-        let mut connected = self.connected.lock().await;
+        let mut lock = self.connected.lock().await;
 
         for info in available_ports
         {
@@ -133,13 +379,17 @@ impl SerialHandler
                     match tokio_serial::new(info.port_name, 9600).open_native_async()
                     {
                         Err(_) => (),
-                        Ok(stream) => match connected.entry(serial_number)
+                        Ok(stream) => match lock.entry(serial_number.clone())
                         {
                             hash_map::Entry::Occupied(_) => (),
                             hash_map::Entry::Vacant(entry) =>
                             {
-                                new(entry.key()).await;
-                                tokio::spawn(handle(entry, stream));
+                                tokio::spawn(handle(
+                                    entry,
+                                    stream,
+                                    self.next_closed_result.clone(),
+                                    self.next_listen_result.clone()));
+                                new(serial_number);
                             },
                         },
                     }
@@ -150,31 +400,32 @@ impl SerialHandler
 }
 
 const ANALOG_READ_MAX: u16 = 1023;
-const ANALOG_WRITE_MAX: u16 = 255;
+const ANALOG_WRITE_MAX: u8 = 255;
 
 fn handle(
     entry: hash_map::VacantEntry<'_, String, SerialHandlerConnection>,
-    stream: SerialStream)
+    stream: SerialStream,
+    next_close: watch::Sender<String>,
+    next_listen: watch::Sender<(String, String, f32)>)
     -> impl Future<Output = ()> + Send + 'static
 {
     const RETRY_DELAY: Duration = Duration::from_millis(500);
-    const EXPECTED_BEAD_VERSION: u16 = 1;
 
     let (rx_stream, tx_stream) = tokio::io::split(stream);
     let mut rx_stream = BufReader::new(rx_stream);
     let mut tx_stream = BufWriter::new(tx_stream);
 
-    let (tx_close, rx_close) = watch::channel(false);
     let (tx_ping, mut rx_ping) = watch::channel(());
     let (tx_ping_result, rx_ping_result) = watch::channel(());
-    let (tx_state, rx_state) = watch::channel(SerialHandlerConnectionState::WaitingConfig);
+    let (tx_state_result, rx_state_result) = watch::channel(SerialHandlerConnectionState::WaitingConfig);
+
+    let id = entry.key().clone();
 
     entry.insert(SerialHandlerConnection
     {
-        closed: rx_close,
         ping: tx_ping,
         ping_result: rx_ping_result,
-        state: rx_state,
+        state_result: rx_state_result,
     });
 
     async fn send_to(writer: &mut (impl AsyncWrite + Unpin), value: impl Serialize) -> io::Result<()>
@@ -241,13 +492,12 @@ fn handle(
                 get_mode: watch::Receiver<()>,
                 get_mode_result: watch::Sender<PinMode>,
                 waiting_get_mode: bool,
-                set_power: watch::Receiver<u16>,
-                set_power_result: watch::Sender<Result<u16, SetPinPowerError>>,
+                set_power: watch::Receiver<u8>,
+                set_power_result: watch::Sender<Result<u8, SetPinPowerError>>,
                 waiting_set_power: bool,
                 set_mode: watch::Receiver<PinMode>,
                 set_mode_result: watch::Sender<Result<PinMode, SetPinModeError>>,
                 waiting_set_mode: bool,
-                listen_result: watch::Sender<u16>,
             }
 
             let (mut pin_interfaces, pins): (Vec<_>, Vec<_>) = config.pins.into_iter()
@@ -261,25 +511,25 @@ fn handle(
                     let (tx_set_power_result, rx_set_power_result) = watch::channel(Ok(0));
                     let (tx_set_mode, rx_set_mode) = watch::channel(PinMode::DigitalInput);
                     let (tx_set_mode_result, rx_set_mode_result) = watch::channel(Ok(PinMode::DigitalInput));
-                    let (tx_listen_result, rx_listen_result) = watch::channel(0);
 
                     (
-                        PinInterface
-                        {
-                            get_power: rx_get_power,
-                            get_power_result: tx_get_power_result,
-                            waiting_get_power: false,
-                            get_mode: rx_get_mode,
-                            get_mode_result: tx_get_mode_result,
-                            waiting_get_mode: false,
-                            set_power: rx_set_power,
-                            set_power_result: tx_set_power_result,
-                            waiting_set_power: false,
-                            set_mode: rx_set_mode,
-                            set_mode_result: tx_set_mode_result,
-                            waiting_set_mode: false,
-                            listen_result: tx_listen_result,
-                        },
+                        (
+                            pin.name.clone(),
+                            PinInterface
+                            {
+                                get_power: rx_get_power,
+                                get_power_result: tx_get_power_result,
+                                waiting_get_power: false,
+                                get_mode: rx_get_mode,
+                                get_mode_result: tx_get_mode_result,
+                                waiting_get_mode: false,
+                                set_power: rx_set_power,
+                                set_power_result: tx_set_power_result,
+                                waiting_set_power: false,
+                                set_mode: rx_set_mode,
+                                set_mode_result: tx_set_mode_result,
+                                waiting_set_mode: false,
+                            }),
                         (
                             pin.name,
                             SerialHandlerPinConnection
@@ -293,14 +543,13 @@ fn handle(
                                 set_power_result: rx_set_power_result,
                                 set_mode: tx_set_mode,
                                 set_mode_result: rx_set_mode_result,
-                                listen_result: rx_listen_result,
                             }))
                 })
                 .unzip();
 
             let name = config.name;
 
-            tx_state.send_modify(|x| *x = SerialHandlerConnectionState::Active
+            _ = tx_state_result.send_replace(SerialHandlerConnectionState::Active
             {
                 name: name.clone(),
                 pins,
@@ -314,7 +563,7 @@ fn handle(
             loop
             {
                 fn poll_many<F>(source: &mut PinEach<Vec<F>>)
-                    -> impl use<'_, F> + FnMut(&mut Context<'_>) -> Poll<(usize, F::Output)>
+                    -> impl FnMut(&mut Context<'_>) -> Poll<(usize, F::Output)>
                 where
                     F: Future,
                 {
@@ -329,14 +578,6 @@ fn handle(
                     }
                 }
 
-                async fn ok_or_never<F, T, E>(f: F) -> T
-                where
-                    F: IntoFuture<Output = Result<T, E>>,
-                {
-                    if let Ok(x) = f.await { return x };
-                    pending().await
-                }
-
                 async fn wait_ok_or_timeout<T: Clone>(
                     value: &mut watch::Receiver<T>,
                     do_timeout: bool) -> T
@@ -347,7 +588,7 @@ fn handle(
                         true => timeout(RETRY_DELAY, value.changed()).await,
                     }
                     {
-                        Err(_) | Ok(Ok(_)) => return value.borrow().clone(),
+                        Err(_) | Ok(Ok(_)) => return watch::Receiver::borrow(value).clone(),
                         Ok(Err(_)) => (),
                     }
 
@@ -359,14 +600,14 @@ fn handle(
                 let mut set_power_waits = Vec::new();
                 let mut set_mode_waits = Vec::new();
 
-                for PinInterface
+                for (_, PinInterface
                 {
                     get_power, waiting_get_power,
                     get_mode, waiting_get_mode,
                     set_power, waiting_set_power,
                     set_mode, waiting_set_mode,
                     ..
-                }
+                })
                 in pin_interfaces.iter_mut()
                 {
                     get_power_waits.push(wait_ok_or_timeout(get_power, *waiting_get_power));
@@ -396,7 +637,7 @@ fn handle(
                         {
                             Ok(incoming::Packet::Pong) =>
                             {
-                                tx_ping_result.send_modify(|x| *x = ());
+                                _ = tx_ping_result.send_replace(());
                             },
                             Ok(incoming::Packet::Config(_)) =>
                             {
@@ -410,8 +651,8 @@ fn handle(
                                 }
                                 else
                                 {
-                                    let pin = &mut pin_interfaces[pin as usize];
-                                    pin.get_power_result.send_modify(|x| *x = power);
+                                    let (_, pin) = &mut pin_interfaces[pin as usize];
+                                    _ = pin.get_power_result.send_replace(power);
                                     pin.waiting_get_power = false;
                                 }
                             },
@@ -423,8 +664,8 @@ fn handle(
                                 }
                                 else
                                 {
-                                    let pin = &mut pin_interfaces[pin as usize];
-                                    pin.get_mode_result.send_modify(|x| *x = mode);
+                                    let (_, pin) = &mut pin_interfaces[pin as usize];
+                                    _ = pin.get_mode_result.send_replace(mode);
                                     pin.waiting_get_power = false;
                                 }
                             },
@@ -436,8 +677,8 @@ fn handle(
                                 }
                                 else
                                 {
-                                    let pin = &mut pin_interfaces[pin as usize];
-                                    pin.set_power_result.send_modify(|x| *x = Ok(power));
+                                    let (_, pin) = &mut pin_interfaces[pin as usize];
+                                    _ = pin.set_power_result.send_replace(Ok(power));
                                     pin.waiting_get_power = false;
                                 }
                             },
@@ -449,8 +690,8 @@ fn handle(
                                 }
                                 else
                                 {
-                                    let pin = &mut pin_interfaces[pin as usize];
-                                    pin.set_mode_result.send_modify(|x| *x = Ok(mode));
+                                    let (_, pin) = &mut pin_interfaces[pin as usize];
+                                    _ = pin.set_mode_result.send_replace(Ok(mode));
                                     pin.waiting_get_power = false;
                                 }
                             },
@@ -462,9 +703,12 @@ fn handle(
                                 }
                                 else
                                 {
-                                    let pin = &mut pin_interfaces[pin as usize];
-                                    pin.listen_result.send_modify(|x| *x = power);
-                                    pin.waiting_get_power = false;
+                                    next_listen.send_modify(|x|
+                                    {
+                                        x.0.clone_from(&name);
+                                        x.1.clone_from(&pin_interfaces[pin as usize].0);
+                                        x.2 = power.min(ANALOG_READ_MAX) as f32 / ANALOG_READ_MAX as f32;
+                                    });
                                 }
                             },
                             Ok(incoming::Packet::InvalidPinMode { byte }) =>
@@ -487,8 +731,9 @@ fn handle(
                                 }
                                 else
                                 {
-                                    let pin = &mut pin_interfaces[pin as usize];
-                                    pin.set_power_result.send_modify(|x| *x = Err(SetPinPowerError::InvalidWriteToInput { power }));
+                                    let power = power.min(ANALOG_WRITE_MAX) as f32 / ANALOG_WRITE_MAX as f32;
+                                    let (_, pin) = &mut pin_interfaces[pin as usize];
+                                    _ = pin.set_power_result.send_replace(Err(SetPinPowerError::InvalidWriteToInput { power }));
                                     pin.waiting_get_power = false;
                                 }
                             },
@@ -500,8 +745,8 @@ fn handle(
                                 }
                                 else
                                 {
-                                    let pin = &mut pin_interfaces[pin as usize];
-                                    pin.set_mode_result.send_modify(|x| *x = Err(SetPinModeError::InvalidUnsupportedMode { mode }));
+                                    let (_, pin) = &mut pin_interfaces[pin as usize];
+                                    _ = pin.set_mode_result.send_replace(Err(SetPinModeError::InvalidUnsupportedMode { mode }));
                                     pin.waiting_get_power = false;
                                 }
                             },
@@ -555,7 +800,7 @@ fn handle(
                     {
                         drop((get_power_waits, get_mode_waits, set_power_waits, set_mode_waits));
 
-                        pin_interfaces[pin as usize].waiting_get_power = true;
+                        pin_interfaces[pin as usize].1.waiting_get_power = true;
                         if let Err(x) = send_to(
                             &mut tx_stream,
                             outgoing::Packet::GetPinPower { pin: pin as u8 }).await
@@ -568,7 +813,7 @@ fn handle(
                     {
                         drop((get_power_waits, get_mode_waits, set_power_waits, set_mode_waits));
 
-                        pin_interfaces[pin as usize].waiting_get_mode = true;
+                        pin_interfaces[pin as usize].1.waiting_get_mode = true;
                         if let Err(x) = send_to(
                             &mut tx_stream,
                             outgoing::Packet::GetPinMode { pin: pin as u8 }).await
@@ -581,7 +826,7 @@ fn handle(
                     {
                         drop((get_power_waits, get_mode_waits, set_power_waits, set_mode_waits));
 
-                        pin_interfaces[pin as usize].waiting_set_power = true;
+                        pin_interfaces[pin as usize].1.waiting_set_power = true;
                         if let Err(x) = send_to(
                             &mut tx_stream,
                             outgoing::Packet::SetPinPower { pin: pin as u8, power }).await
@@ -594,7 +839,7 @@ fn handle(
                     {
                         drop((get_power_waits, get_mode_waits, set_power_waits, set_mode_waits));
 
-                        pin_interfaces[pin as usize].waiting_set_mode = true;
+                        pin_interfaces[pin as usize].1.waiting_set_mode = true;
                         if let Err(x) = send_to(
                             &mut tx_stream,
                             outgoing::Packet::SetPinMode { pin: pin as u8, mode }).await
@@ -607,6 +852,7 @@ fn handle(
             }
         }
 
-        tx_close.send_modify(|x| *x = true);
+        _ = tx_state_result.send_replace(SerialHandlerConnectionState::Closed);
+        _ = next_close.send_replace(id);
     }
 }

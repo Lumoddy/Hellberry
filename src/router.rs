@@ -1,5 +1,9 @@
+use std::future::{pending, poll_fn};
 use std::path::PathBuf;
+use std::pin::Pin;
 use std::sync::Arc;
+use std::task::{Context, Poll};
+use std::time::Duration;
 
 use axum::body::Body;
 use axum::extract::ws::Utf8Bytes;
@@ -7,10 +11,11 @@ use axum::extract::{WebSocketUpgrade, ws};
 use axum::http::{HeaderValue, Response, StatusCode, header};
 use axum::response::IntoResponse;
 use axum::routing;
-use tokio::fs;
+use tokio::time::interval;
+use tokio::{fs, select};
 
-use crate::bead::serial_handler::SerialHandler;
-use crate::bead::{ConfigPin, PinMode};
+use crate::bead::serial_handler::{GetPinModeError, GetPinPowerError, PingError, SerialHandler, SetPinModeError, SetPinPowerError};
+use crate::bead::{Config, ConfigPin, PinMode};
 use crate::log::*;
 
 pub fn media_type_of_path(path: &(impl ?Sized + AsRef<[u8]>)) -> &'static str
@@ -28,10 +33,10 @@ pub fn media_type_of_path(path: &(impl ?Sized + AsRef<[u8]>)) -> &'static str
 
 pub struct Router
 {
-    config_name: Option<String>,
-    logo_path: Option<PathBuf>,
-    simple_logo_path: Option<PathBuf>,
-    serial_handler: Arc<SerialHandler>,
+    pub config_name: Option<String>,
+    pub logo_path: Option<PathBuf>,
+    pub simple_logo_path: Option<PathBuf>,
+    pub serial_handler: Arc<SerialHandler>,
 }
 
 impl From<Router> for routing::Router
@@ -104,7 +109,7 @@ impl From<Router> for routing::Router
                     #[serde(tag = "type", rename_all = "kebab-case")]
                     enum Incoming
                     {
-                        Ping,
+                        Ping { bead_name: String },
                         WholeConfig,
                         GetBeadPinPower { bead_name: String, pin_name: String },
                         GetBeadPinMode { bead_name: String, pin_name: String },
@@ -116,7 +121,7 @@ impl From<Router> for routing::Router
                     #[serde(tag = "type", rename_all = "kebab-case")]
                     enum Outgoing<'a>
                     {
-                        Pong,
+                        Pong { bead_name: &'a str },
                         Config
                         {
                             #[serde(skip_serializing_if = "Option::is_none")]
@@ -124,171 +129,421 @@ impl From<Router> for routing::Router
                         },
                         BeadConnected { bead_name: &'a str, pins: &'a [ConfigPin] },
                         BeadDisconnected { bead_name: &'a str },
+                        BeadDisconnectedInterruption { bead_name: &'a str },
                         GetBeadPinPowerResponse { bead_name: &'a str, pin_name: &'a str, power: f32 },
                         GetBeadPinModeResponse { bead_name: &'a str, pin_name: &'a str, mode: PinMode },
                         SetBeadPinPowerResponse { bead_name: &'a str, pin_name: &'a str },
                         SetBeadPinModeResponse { bead_name: &'a str, pin_name: &'a str },
                         BeadPinListen { bead_name: &'a str, pin_name: &'a str, power: f32 },
-                        InvalidBeadPinName { pin_name: &'a str },
-                        InvalidWriteToInput { pin_name: &'a str, power: f32 },
-                        InvalidUnsupportedMode { pin_name: &'a str, mode: PinMode },
+                        InvalidBeadName { bead_name: &'a str },
+                        InvalidBeadPinName { bead_name: &'a str, pin_name: &'a str },
+                        InvalidWriteToInput { bead_name: &'a str, pin_name: &'a str, power: f32 },
+                        InvalidUnsupportedMode { bead_name: &'a str, pin_name: &'a str, mode: PinMode },
                         InvalidIncoming,
                     }
 
-                    while let Some(Ok(msg)) = ws.recv().await
-                    {
-                        let msg = match msg
-                        {
-                            ws::Message::Text(x) => x.into(),
-                            ws::Message::Binary(x) => x,
-                            _ => continue,
-                        };
+                    let mut update_interval = interval(Duration::from_secs_f32(0.5));
+                    let mut setup_list = Vec::new();
 
-                        match serde_json::from_slice(&msg)
+                    loop
+                    {
+                        fn poll_many<F>(source: &mut Vec<Pin<Box<F>>>)
+                            -> impl FnMut(&mut Context<'_>) -> Poll<F::Output>
+                        where
+                            F: Future,
                         {
-                            Ok(Incoming::Ping) =>
+                            move |cx|
                             {
-                                if ws.send(ws::Message::Text(Utf8Bytes::from(
-                                    serde_json::to_string(&Outgoing::Pong).unwrap()))).await.is_err()
+                                for f in source.iter_mut()
+                                {
+                                    if let Poll::Ready(x) = f.as_mut().poll(cx) { return Poll::Ready(x) };
+                                }
+
+                                Poll::Pending
+                            }
+                        }
+
+                        async fn ok_or_never<F, T, E>(f: F) -> T
+                        where
+                            F: IntoFuture<Output = Result<T, E>>,
+                        {
+                            if let Ok(x) = f.await { return x };
+                            pending().await
+                        }
+
+                        select!
+                        {
+                            biased;
+
+                            msg = ws.recv() =>
+                            {
+                                let msg = match msg
+                                {
+                                    Some(Ok(ws::Message::Text(x))) => x.into(),
+                                    Some(Ok(ws::Message::Binary(x))) => x,
+                                    Some(Ok(ws::Message::Close(_))) | None => break,
+                                    Some(Ok(ws::Message::Ping(_) | ws::Message::Pong(_))) => continue,
+                                    Some(Err(x)) =>
+                                    {
+                                        eprintln!("{Error}: Failed to receive message from websocket: {}.", x);
+                                        break;
+                                    },
+                                };
+
+                                match serde_json::from_slice(&msg)
+                                {
+                                    Ok(Incoming::Ping { bead_name }) =>
+                                    {
+                                        match handler.ping(&bead_name).await
+                                        {
+                                            None =>
+                                            {
+                                                if let Err(_) = ws.send(ws::Message::Text(Utf8Bytes::from(
+                                                    serde_json::to_string(&Outgoing::InvalidBeadName
+                                                    {
+                                                        bead_name: &bead_name,
+                                                    }).unwrap()))).await
+                                                {
+                                                    break;
+                                                }
+                                            },
+                                            Some(Ok(())) =>
+                                            {
+                                                if let Err(_) = ws.send(ws::Message::Text(Utf8Bytes::from(
+                                                    serde_json::to_string(&Outgoing::Pong
+                                                    {
+                                                        bead_name: &bead_name,
+                                                    }).unwrap()))).await
+                                                {
+                                                    break;
+                                                }
+                                            },
+                                            Some(Err(PingError::BeadClosed)) =>
+                                            {
+                                                if let Err(_) = ws.send(ws::Message::Text(Utf8Bytes::from(
+                                                    serde_json::to_string(&Outgoing::BeadDisconnectedInterruption
+                                                    {
+                                                        bead_name: &bead_name,
+                                                    }).unwrap()))).await
+                                                {
+                                                    break;
+                                                }
+                                            },
+                                        }
+                                    },
+                                    Ok(Incoming::WholeConfig) =>
+                                    {
+                                        if let Err(_) = ws.send(ws::Message::Text(Utf8Bytes::from(
+                                            serde_json::to_string(&Outgoing::Config
+                                            {
+                                                name: config_name.as_deref(),
+                                            }).unwrap()))).await
+                                        {
+                                            break;
+                                        }
+                                    },
+                                    Ok(Incoming::GetBeadPinPower { bead_name, pin_name }) =>
+                                    {
+                                        match handler.get_pin_power(&bead_name, &pin_name).await
+                                        {
+                                            None =>
+                                            {
+                                                if let Err(_) = ws.send(ws::Message::Text(Utf8Bytes::from(
+                                                    serde_json::to_string(&Outgoing::InvalidBeadPinName
+                                                    {
+                                                        bead_name: &bead_name,
+                                                        pin_name: &pin_name,
+                                                    }).unwrap()))).await
+                                                {
+                                                    break;
+                                                }
+                                            },
+                                            Some(Ok(power)) =>
+                                            {
+                                                if let Err(_) = ws.send(ws::Message::Text(Utf8Bytes::from(
+                                                    serde_json::to_string(&Outgoing::GetBeadPinPowerResponse
+                                                    {
+                                                        bead_name: &bead_name,
+                                                        pin_name: &pin_name,
+                                                        power,
+                                                    }).unwrap()))).await
+                                                {
+                                                    break;
+                                                }
+                                            },
+                                            Some(Err(GetPinPowerError::BeadClosed)) =>
+                                            {
+                                                if let Err(_) = ws.send(ws::Message::Text(Utf8Bytes::from(
+                                                    serde_json::to_string(&Outgoing::BeadDisconnectedInterruption
+                                                    {
+                                                        bead_name: &bead_name,
+                                                    }).unwrap()))).await
+                                                {
+                                                    break;
+                                                }
+                                            },
+                                            Some(Err(GetPinPowerError::InvalidBeadPinName)) =>
+                                            {
+                                                if let Err(_) = ws.send(ws::Message::Text(Utf8Bytes::from(
+                                                    serde_json::to_string(&Outgoing::InvalidBeadPinName
+                                                    {
+                                                        bead_name: &bead_name,
+                                                        pin_name: &pin_name,
+                                                    }).unwrap()))).await
+                                                {
+                                                    break;
+                                                }
+                                            },
+                                        }
+                                    },
+                                    Ok(Incoming::GetBeadPinMode { bead_name, pin_name }) =>
+                                    {
+                                        match handler.get_pin_mode(&bead_name, &pin_name).await
+                                        {
+                                            None =>
+                                            {
+                                                if let Err(_) = ws.send(ws::Message::Text(Utf8Bytes::from(
+                                                    serde_json::to_string(&Outgoing::InvalidBeadPinName
+                                                    {
+                                                        bead_name: &bead_name,
+                                                        pin_name: &pin_name,
+                                                    }).unwrap()))).await
+                                                {
+                                                    break;
+                                                }
+                                            },
+                                            Some(Ok(mode)) =>
+                                            {
+                                                if let Err(_) = ws.send(ws::Message::Text(Utf8Bytes::from(
+                                                    serde_json::to_string(&Outgoing::GetBeadPinModeResponse
+                                                    {
+                                                        bead_name: &bead_name,
+                                                        pin_name: &pin_name,
+                                                        mode,
+                                                    }).unwrap()))).await
+                                                {
+                                                    break;
+                                                }
+                                            },
+                                            Some(Err(GetPinModeError::BeadClosed)) =>
+                                            {
+                                                if let Err(_) = ws.send(ws::Message::Text(Utf8Bytes::from(
+                                                    serde_json::to_string(&Outgoing::BeadDisconnectedInterruption
+                                                    {
+                                                        bead_name: &bead_name,
+                                                    }).unwrap()))).await
+                                                {
+                                                    break;
+                                                }
+                                            },
+                                            Some(Err(GetPinModeError::InvalidBeadPinName)) =>
+                                            {
+                                                if let Err(_) = ws.send(ws::Message::Text(Utf8Bytes::from(
+                                                    serde_json::to_string(&Outgoing::InvalidBeadPinName
+                                                    {
+                                                        bead_name: &bead_name,
+                                                        pin_name: &pin_name,
+                                                    }).unwrap()))).await
+                                                {
+                                                    break;
+                                                }
+                                            },
+                                        }
+                                    },
+                                    Ok(Incoming::SetBeadPinPower { bead_name, pin_name, power }) =>
+                                    {
+                                        match handler.set_pin_power(&bead_name, &pin_name, power).await
+                                        {
+                                            None =>
+                                            {
+                                                if let Err(_) = ws.send(ws::Message::Text(Utf8Bytes::from(
+                                                    serde_json::to_string(&Outgoing::InvalidBeadPinName
+                                                    {
+                                                        bead_name: &bead_name,
+                                                        pin_name: &pin_name,
+                                                    }).unwrap()))).await
+                                                {
+                                                    break;
+                                                }
+                                            },
+                                            Some(Ok(_)) =>
+                                            {
+                                                if let Err(_) = ws.send(ws::Message::Text(Utf8Bytes::from(
+                                                    serde_json::to_string(&Outgoing::SetBeadPinPowerResponse
+                                                    {
+                                                        bead_name: &bead_name,
+                                                        pin_name: &pin_name,
+                                                    }).unwrap()))).await
+                                                {
+                                                    break;
+                                                }
+                                            },
+                                            Some(Err(SetPinPowerError::BeadClosed)) =>
+                                            {
+                                                if let Err(_) = ws.send(ws::Message::Text(Utf8Bytes::from(
+                                                    serde_json::to_string(&Outgoing::BeadDisconnectedInterruption
+                                                    {
+                                                        bead_name: &bead_name,
+                                                    }).unwrap()))).await
+                                                {
+                                                    break;
+                                                }
+                                            },
+                                            Some(Err(SetPinPowerError::InvalidBeadPinName)) =>
+                                            {
+                                                if let Err(_) = ws.send(ws::Message::Text(Utf8Bytes::from(
+                                                    serde_json::to_string(&Outgoing::InvalidBeadPinName
+                                                    {
+                                                        bead_name: &bead_name,
+                                                        pin_name: &pin_name,
+                                                    }).unwrap()))).await
+                                                {
+                                                    break;
+                                                }
+                                            },
+                                            Some(Err(SetPinPowerError::InvalidWriteToInput { power })) =>
+                                            {
+                                                if let Err(_) = ws.send(ws::Message::Text(Utf8Bytes::from(
+                                                    serde_json::to_string(&Outgoing::InvalidWriteToInput
+                                                    {
+                                                        bead_name: &bead_name,
+                                                        pin_name: &pin_name,
+                                                        power,
+                                                    }).unwrap()))).await
+                                                {
+                                                    break;
+                                                }
+                                            },
+                                        }
+                                    },
+                                    Ok(Incoming::SetBeadPinMode { bead_name, pin_name, mode }) =>
+                                    {
+                                        match handler.set_pin_mode(&bead_name, &pin_name, mode).await
+                                        {
+                                            None =>
+                                            {
+                                                if let Err(_) = ws.send(ws::Message::Text(Utf8Bytes::from(
+                                                    serde_json::to_string(&Outgoing::InvalidBeadPinName
+                                                    {
+                                                        bead_name: &bead_name,
+                                                        pin_name: &pin_name,
+                                                    }).unwrap()))).await
+                                                {
+                                                    break;
+                                                }
+                                            },
+                                            Some(Ok(_)) =>
+                                            {
+                                                if let Err(_) = ws.send(ws::Message::Text(Utf8Bytes::from(
+                                                    serde_json::to_string(&Outgoing::SetBeadPinModeResponse
+                                                    {
+                                                        bead_name: &bead_name,
+                                                        pin_name: &pin_name,
+                                                    }).unwrap()))).await
+                                                {
+                                                    break;
+                                                }
+                                            },
+                                            Some(Err(SetPinModeError::BeadClosed)) =>
+                                            {
+                                                if let Err(_) = ws.send(ws::Message::Text(Utf8Bytes::from(
+                                                    serde_json::to_string(&Outgoing::BeadDisconnectedInterruption
+                                                    {
+                                                        bead_name: &bead_name,
+                                                    }).unwrap()))).await
+                                                {
+                                                    break;
+                                                }
+                                            },
+                                            Some(Err(SetPinModeError::InvalidBeadPinName)) =>
+                                            {
+                                                if let Err(_) = ws.send(ws::Message::Text(Utf8Bytes::from(
+                                                    serde_json::to_string(&Outgoing::InvalidBeadPinName
+                                                    {
+                                                        bead_name: &bead_name,
+                                                        pin_name: &pin_name,
+                                                    }).unwrap()))).await
+                                                {
+                                                    break;
+                                                }
+                                            },
+                                            Some(Err(SetPinModeError::InvalidUnsupportedMode { mode })) =>
+                                            {
+                                                if let Err(_) = ws.send(ws::Message::Text(Utf8Bytes::from(
+                                                    serde_json::to_string(&Outgoing::InvalidUnsupportedMode
+                                                    {
+                                                        bead_name: &bead_name,
+                                                        pin_name: &pin_name,
+                                                        mode,
+                                                    }).unwrap()))).await
+                                                {
+                                                    break;
+                                                }
+                                            },
+                                        }
+                                    },
+                                    Err(_) =>
+                                    {
+                                        if let Err(_) = ws.send(ws::Message::Text(Utf8Bytes::from(
+                                            serde_json::to_string(&Outgoing::InvalidIncoming).unwrap()))).await
+                                        {
+                                            break;
+                                        }
+                                    },
+                                }
+                            },
+                            config = poll_fn(poll_many(&mut setup_list)) =>
+                            {
+                                let config: Config = config;
+
+                                if let Err(_) = ws.send(ws::Message::Text(Utf8Bytes::from(
+                                    serde_json::to_string(&Outgoing::BeadConnected
+                                    {
+                                        bead_name: &config.name,
+                                        pins: &config.pins,
+                                    }).unwrap()))).await
                                 {
                                     break;
                                 }
                             },
-                            Ok(Incoming::WholeConfig) =>
+                            Ok(bead_name) = handler.next_closed() =>
                             {
-                                if ws.send(ws::Message::Text(Utf8Bytes::from(
-                                    serde_json::to_string(&Outgoing::Config
+                                eprintln!("{Success} Bead '{bead_name}' closed.");
+
+                                _ = ws.send(ws::Message::Text(Utf8Bytes::from(
+                                    serde_json::to_string(&Outgoing::BeadDisconnected
                                     {
-                                        name: config_name.as_deref(),
-                                    }).unwrap()))).await.is_err()
+                                        bead_name: &bead_name,
+                                    }).unwrap()))).await;
+
+                                break;
+                            },
+                            Ok((bead_name, pin_name, power)) = handler.next_listen() =>
+                            {
+                                if let Err(_) = ws.send(ws::Message::Text(Utf8Bytes::from(
+                                    serde_json::to_string(&Outgoing::BeadPinListen
+                                    {
+                                        bead_name: &bead_name,
+                                        pin_name: &pin_name,
+                                        power,
+                                    }).unwrap()))).await
                                 {
                                     break;
                                 }
                             },
-                            Ok(Incoming::GetBeadPinPower { bead_name, pin_name }) =>
+                            _ = update_interval.tick() =>
                             {
-                                match handler.get_pin_power(&bead_name, &pin_name).await
+                                let mut new = Vec::new();
+
+                                handler.update(|x| new.push(x)).await;
+
+                                for new in new
                                 {
-                                    Ok(power) =>
+                                    let handler = handler.clone();
+                                    setup_list.push(Box::pin(ok_or_never(async move
                                     {
-                                        if ws.send(ws::Message::Text(Utf8Bytes::from(
-                                            serde_json::to_string(&Outgoing::GetBeadPinPowerResponse
-                                            {
-                                                bead_name: &bead_name,
-                                                pin_name: &pin_name,
-                                                power,
-                                            }).unwrap()))).await.is_err()
-                                        {
-                                            break;
-                                        }
-                                    },
-                                    Err(_) =>
-                                    {
-                                        if ws.send(ws::Message::Text(Utf8Bytes::from(
-                                            serde_json::to_string(&Outgoing::InvalidBeadPinName
-                                            {
-                                                pin_name: &pin_name,
-                                            }).unwrap()))).await.is_err()
-                                        {
-                                            break;
-                                        }
-                                    },
-                                }
-                            },
-                            Ok(Incoming::GetBeadPinMode { bead_name, pin_name }) =>
-                            {
-                                match handler.get_pin_mode(&bead_name, &pin_name).await
-                                {
-                                    Ok(mode) =>
-                                    {
-                                        if ws.send(ws::Message::Text(Utf8Bytes::from(
-                                            serde_json::to_string(&Outgoing::GetBeadPinModeResponse
-                                            {
-                                                bead_name: &bead_name,
-                                                pin_name: &pin_name,
-                                                mode,
-                                            }).unwrap()))).await.is_err()
-                                        {
-                                            break;
-                                        }
-                                    },
-                                    Err(_) =>
-                                    {
-                                        if ws.send(ws::Message::Text(Utf8Bytes::from(
-                                            serde_json::to_string(&Outgoing::InvalidBeadPinName
-                                            {
-                                                pin_name: &pin_name,
-                                            }).unwrap()))).await.is_err()
-                                        {
-                                            break;
-                                        }
-                                    },
-                                }
-                            },
-                            Ok(Incoming::SetBeadPinPower { bead_name, pin_name, power }) =>
-                            {
-                                match handler.set_pin_power(&bead_name, &pin_name, power).await
-                                {
-                                    Ok(()) =>
-                                    {
-                                        if ws.send(ws::Message::Text(Utf8Bytes::from(
-                                            serde_json::to_string(&Outgoing::SetBeadPinPowerResponse
-                                            {
-                                                bead_name: &bead_name,
-                                                pin_name: &pin_name,
-                                            }).unwrap()))).await.is_err()
-                                        {
-                                            break;
-                                        }
-                                    },
-                                    Err(_) =>
-                                    {
-                                        if ws.send(ws::Message::Text(Utf8Bytes::from(
-                                            serde_json::to_string(&Outgoing::InvalidBeadPinName
-                                            {
-                                                pin_name: &pin_name,
-                                            }).unwrap()))).await.is_err()
-                                        {
-                                            break;
-                                        }
-                                    },
-                                }
-                            },
-                            Ok(Incoming::SetBeadPinMode { bead_name, pin_name, mode }) =>
-                            {
-                                match handler.set_pin_mode(&bead_name, &pin_name, mode).await
-                                {
-                                    Ok(()) =>
-                                    {
-                                        if ws.send(ws::Message::Text(Utf8Bytes::from(
-                                            serde_json::to_string(&Outgoing::SetBeadPinModeResponse
-                                            {
-                                                bead_name: &bead_name,
-                                                pin_name: &pin_name,
-                                            }).unwrap()))).await.is_err()
-                                        {
-                                            break;
-                                        }
-                                    },
-                                    Err(_) =>
-                                    {
-                                        if ws.send(ws::Message::Text(Utf8Bytes::from(
-                                            serde_json::to_string(&Outgoing::InvalidBeadPinName
-                                            {
-                                                pin_name: &pin_name,
-                                            }).unwrap()))).await.is_err()
-                                        {
-                                            break;
-                                        }
-                                    },
-                                }
-                            },
-                            Err(_) =>
-                            {
-                                if ws.send(ws::Message::Text(Utf8Bytes::from(
-                                    serde_json::to_string(&Outgoing::InvalidIncoming).unwrap()))).await.is_err()
-                                {
-                                    break;
+                                        handler.config(&new).await.unwrap()
+                                    })));
                                 }
                             },
                         }
