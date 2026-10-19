@@ -1,17 +1,3 @@
-// use std::env;
-// use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
-// use std::path::PathBuf;
-// use std::sync::Arc;
-// use std::time::Duration;
-
-// use bead::serial_handler::SerialHandler;
-// use config::{Configuration, read_config};
-// use router::router;
-// use tokio::time::timeout;
-// use tokio::{select, signal};
-// use tokio::net::{TcpListener, UdpSocket};
-// use tokio::sync::OnceCell;
-
 use axum::routing;
 use bead::serial_handler::SerialHandler;
 use broadcaster::Broadcaster;
@@ -25,6 +11,7 @@ use std::env;
 use std::ffi::OsString;
 use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
 use std::ops::ControlFlow;
+use std::sync::Arc;
 use std::time::Duration;
 
 mod args;
@@ -132,7 +119,18 @@ async fn main()
                 },
             }
 
-            eprintln!("{Success} Started broadcasting to {}.", broadcaster.peer_addr().unwrap());
+            match broadcaster.peer_addr()
+            {
+                Ok(addr) =>
+                {
+                    eprintln!("{Success} Started broadcasting to {}.", addr);
+                },
+                Err(error) =>
+                {
+                    eprintln!("{Error} Failed to verify broadcaster on port {broadcast_port}: {error}.");
+                    return;
+                },
+            }
 
             tokio::spawn(Broadcaster
             {
@@ -158,8 +156,9 @@ async fn main()
                     config_name: berry_name,
                     logo_path: config.logo_path,
                     simple_logo_path: config.simple_logo_path,
-                    serial_handler: SerialHandler::new().into(),
+                    serial_handler: Arc::new(SerialHandler::new()),
                 }))
+                .with_graceful_shutdown(shutdown_signal())
                 .await
                 .unwrap();
         },
@@ -177,11 +176,14 @@ async fn main()
 fn show_help()
 {
     eprintln!("\
-{Success} Relays the state of the connected Hellberry Beads (usually Arduinos) through a hosted http server with websocket support.
+{Success} Relays the state of the connected \"Hellberry Beads\" (usually Arduinos) through a hosted http server with websocket support.
 
-  {ANSICyan}run{ANSIReset} Starts the http server.
+  {ANSICyan}run{ANSIReset} Starts the server.
     {ANSIYellow}-listen -listen_port{ANSIReset} The port the http server will listen on.
     {ANSIYellow}-broadcast -broadcast_port{ANSIReset} The port to broadcast to on the local network.
+    {ANSIYellow}-name -berry-name{ANSIReset} The name of this Hellberry.
+
+  {ANSICyan}help{ANSIReset} Shows this help message.
 
 A config file at \'./config.json\' or \'./config.yaml\' can be used to specify more options:
 
