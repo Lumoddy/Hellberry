@@ -1,31 +1,35 @@
-use tokio::io::{self, AsyncWrite};
+use std::fmt;
 
 use crate::bead::PinMode;
-use crate::packet::Serialize;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub enum Packet
-{
+pub enum Packet {
+    /// Encoded as `"ping"`.
     Ping,
-    WholeConfig,
-    GetPinPower { pin: u8 },
-    GetPinMode { pin: u8 },
-    SetPinPower { pin: u8, power: u8 },
-    SetPinMode { pin: u8, mode: PinMode },
+    /// Encoded as `"config"`.
+    Config,
+    /// Encoded as `"pins.{pin}.getPower()"`.
+    GetPinPower { pin: String },
+    /// Encoded as `"pins.{pin}.getMode()"`.
+    GetPinMode { pin: String },
+    /// Encoded as `"pins.{pin}.flags"`.
+    PinFlags { pin: String },
+    /// Encoded as `"pins.{pin}.setPower({power})"`.
+    SetPinPower { pin: String, power: u8 },
+    /// Encoded as `"pins.{pin}.setMode({mode})"`.
+    SetPinMode { pin: String, mode: PinMode },
 }
 
-impl Serialize for Packet
-{
-    async fn write_to(&self, writer: &mut (impl AsyncWrite + Unpin)) -> io::Result<()>
-    {
-        match self
-        {
-            Self::Ping => (0u8,).write_to(writer).await,
-            Self::WholeConfig => (1u8,).write_to(writer).await,
-            Self::GetPinPower { pin } => (2u8, pin).write_to(writer).await,
-            Self::GetPinMode { pin } => (3u8, pin).write_to(writer).await,
-            Self::SetPinPower { pin, power } => (4u8, pin, power).write_to(writer).await,
-            Self::SetPinMode { pin, mode } => (5u8, pin, mode).write_to(writer).await,
+impl fmt::Display for Packet {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Packet::Ping => write!(f, "ping"),
+            Packet::Config => write!(f, "config"),
+            Packet::GetPinPower { pin } => write!(f, "pins.{}.getPower()", pin),
+            Packet::GetPinMode { pin } => write!(f, "pins.{}.getMode()", pin),
+            Packet::PinFlags { pin } => write!(f, "pins.{}.flags", pin),
+            Packet::SetPinPower { pin, power } => write!(f, "pins.{}.setPower({})", pin, power),
+            Packet::SetPinMode { pin, mode } => write!(f, "pins.{}.setMode({})", pin, mode),
         }
     }
 }

@@ -5,37 +5,18 @@ use std::sync::Arc;
 use std::task::{Context, Poll};
 use std::time::Duration;
 
-use axum::body::Body;
 use axum::extract::ws::Utf8Bytes;
 use axum::extract::{WebSocketUpgrade, ws};
-use axum::http::{HeaderValue, Response, StatusCode, header};
-use axum::response::IntoResponse;
 use axum::routing;
 use tokio::time::interval;
-use tokio::{fs, select};
+use tokio::select;
 
-use crate::bead::serial_handler::{GetPinModeError, GetPinPowerError, PingError, SerialHandler, SetPinModeError, SetPinPowerError};
-use crate::bead::{Config, ConfigPin, PinMode};
+use crate::bead::SerialHandler;
 use crate::log::*;
-
-pub fn media_type_of_path(path: &(impl ?Sized + AsRef<[u8]>)) -> &'static str
-{
-    match path.as_ref()
-    {
-        x if x.ends_with(b".png") || x.ends_with(b".PNG") => "image/png",
-        x if x.ends_with(b".jpg") || x.ends_with(b".JPG")
-            || x.ends_with(b".jpeg") || x.ends_with(b".JPEG") => "image/jpeg",
-        x if x.ends_with(b".webp") || x.ends_with(b".WEBP") => "image/webp",
-        x if x.ends_with(b".svg") || x.ends_with(b".SVG") => "image/svg+xml",
-        _ => "application/octet-stream",
-    }
-}
 
 pub struct Router
 {
     pub config_name: Option<String>,
-    pub logo_path: Option<PathBuf>,
-    pub simple_logo_path: Option<PathBuf>,
     pub serial_handler: Arc<SerialHandler>,
 }
 
@@ -44,60 +25,6 @@ impl From<Router> for routing::Router
     fn from(value: Router) -> Self
     {
         routing::Router::new()
-            .route("/logo", routing::get(
-            {
-                let path = value.logo_path;
-
-                async move ||
-                {
-                    let Some(ref path) = path else { return StatusCode::NOT_FOUND.into_response() };
-
-                    let file = match fs::read(&path).await
-                    {
-                        Ok(x) => x,
-                        Err(error) =>
-                        {
-                            eprintln!("{Warn}: Failed to connect broadcaster: {}.", error);
-                            return StatusCode::INTERNAL_SERVER_ERROR.into_response();
-                        },
-                    };
-
-                    let mime_type = media_type_of_path(path.as_os_str().as_encoded_bytes());
-
-                    Response::builder()
-                        .status(StatusCode::OK)
-                        .header(header::CONTENT_TYPE, HeaderValue::from_static(mime_type))
-                        .body(Body::from(file))
-                        .unwrap()
-                }
-            }))
-            .route("/simple-logo", routing::get(
-            {
-                let path = value.simple_logo_path;
-
-                async move ||
-                {
-                    let Some(ref path) = path else { return StatusCode::NOT_FOUND.into_response() };
-
-                    let file = match fs::read(&path).await
-                    {
-                        Ok(x) => x,
-                        Err(error) =>
-                        {
-                            eprintln!("{Warn}: Failed to connect broadcaster: {}.", error);
-                            return StatusCode::INTERNAL_SERVER_ERROR.into_response();
-                        },
-                    };
-
-                    let mime_type = media_type_of_path(path.as_os_str().as_encoded_bytes());
-
-                    Response::builder()
-                        .status(StatusCode::OK)
-                        .header(header::CONTENT_TYPE, HeaderValue::from_static(mime_type))
-                        .body(Body::from(file))
-                        .unwrap()
-                }
-            }))
             .route("/ws", routing::get(async move |ws| WebSocketUpgrade::on_upgrade(ws,
             {
                 let config_name = value.config_name;

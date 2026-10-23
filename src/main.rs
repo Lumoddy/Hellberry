@@ -1,91 +1,44 @@
 use axum::routing;
-use bead::serial_handler::SerialHandler;
-use broadcaster::Broadcaster;
+use bead::SerialHandler;
 use router::Router;
 use tokio::time::interval;
-use tokio::{io, signal};
+use tokio::{select, signal};
 use tokio::net::{TcpListener, UdpSocket};
 
-use std::convert::Infallible;
-use std::env;
 use std::ffi::OsString;
 use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
-use std::ops::ControlFlow;
 use std::sync::Arc;
 use std::time::Duration;
 
 mod args;
 
-mod config;
-
-mod packet;
+mod de;
 
 mod bead;
 
 mod router;
 
-mod broadcaster;
+mod broadcast;
 
 mod log;
 use log::*;
 
 #[tokio::main]
-async fn main()
-{
-    match args::parse_args(std::env::args_os().skip(1).map(OsString::into_encoded_bytes))
-    {
-        Ok(Some(args::Command::Run { listen_port, broadcast_port, berry_name })) =>
-        {
-            let config = match config::read_config(&env::current_dir().unwrap()).await
-            {
-                Ok(x) => x,
-                Err(errors) =>
-                {
-                    if errors.iter().all(|(_, error)| matches!(
-                        error,
-                        config::ReadError::Io(error) if error.kind() == io::ErrorKind::NotFound))
-                    {
-                        config::Configuration::default()
-                    }
-                    else if errors.iter().any(|(_, error)| matches!(
-                        error,
-                        config::ReadError::JsonLenient(_) | config::ReadError::Yaml(_)))
-                    {
-                        for (name, error) in errors
-                        {
-                            if matches!(error, config::ReadError::Io(_)) { continue };
-
-                            eprintln!("{Error} Failed to parse '{name}': {error}");
-                        }
-
-                        return;
-                    }
-                    else
-                    {
-                        for (name, error) in errors
-                        {
-                            eprintln!("{Error} Failed to read '{name}': {error}");
-                        }
-
-                        return;
-                    }
-                },
-            };
-
-            let listen_port = listen_port.or(config.listen_port).unwrap_or(0);
-            let broadcast_port = broadcast_port.or(config.broadcast_port).unwrap_or(0);
-            let berry_name = berry_name.or(config.berry_name);
-
+async fn main() {
+    match args::parse_args(std::env::args_os().skip(1).map(OsString::into_encoded_bytes)) {
+        Ok(Some(args::Command::Run { listen_port, broadcast_port, berry_name })) => {
             let local_broadcast_ip = local_ip_address::local_broadcast_ip().unwrap();
             let local_ip = local_ip_address::local_ip().unwrap();
+
+            let listen_port = listen_port.unwrap_or(0);
+            let broadcast_port = broadcast_port.unwrap_or(0);
 
             let listener = match TcpListener::bind(SocketAddrV4::new(
                 Ipv4Addr::new(0, 0, 0, 0),
                 listen_port)).await
             {
                 Ok(x) => x,
-                Err(error) =>
-                {
+                Err(error) => {
                     eprintln!("{Error} Failed to start listener on port {listen_port}: {error}.");
                     return;
                 },
@@ -98,8 +51,7 @@ async fn main()
                 0)).await
             {
                 Ok(x) => x,
-                Err(error) =>
-                {
+                Err(error) => {
                     eprintln!("{Error} Failed to start broadcaster: {error}.");
                     return;
                 },
@@ -112,8 +64,7 @@ async fn main()
                 broadcast_port)).await
             {
                 Ok(x) => x,
-                Err(error) =>
-                {
+                Err(error) => {
                     eprintln!("{Error} Failed to connect broadcaster on port {broadcast_port}: {error}.");
                     return;
                 },
@@ -121,53 +72,50 @@ async fn main()
 
             match broadcaster.peer_addr()
             {
-                Ok(addr) =>
-                {
+                Ok(addr) => {
                     eprintln!("{Success} Started broadcasting to {}.", addr);
                 },
-                Err(error) =>
-                {
+                Err(error) => {
                     eprintln!("{Error} Failed to verify broadcaster on port {broadcast_port}: {error}.");
                     return;
                 },
             }
 
-            tokio::spawn(Broadcaster
-            {
-                socket: broadcaster,
-                message: Vec::from(match &berry_name
-                {
-                    Some(name) => format!("[Hellberry {name}:{local_ip}]"),
-                    None => format!("[Hellberry:{local_ip}]"),
-                }),
-                interval: interval(Duration::from_secs_f32(1.0)),
-                on_error: async |error|
-                {
-                    eprintln!("{Warn} Failed to broadcast: {error}.");
-                    ControlFlow::Continue::<Infallible>(())
+            tokio::spawn({
+                let message = broadcast::message(
+                    berry_name.as_deref(),
+                    SocketAddr::new(local_ip, broadcast_port));
+                let mut interval = interval(Duration::from_secs_f32(1.0));
+                async move {
+                    loop {
+                        select! {
+                            _ = interval.tick() => {
+                                if let Err(error) = broadcaster.send(message.as_bytes()).await {
+                                    eprintln!("{Error} Failed to broadcast message: {error}.");
+                                }
+                            },
+                            () = shutdown_signal() => {
+                                break;
+                            },
+                        }
+                    }
                 }
-            }
-                .run());
+            });
 
             axum::serve(
                 listener,
-                routing::Router::from(Router
-                {
+                routing::Router::from(Router {
                     config_name: berry_name,
-                    logo_path: config.logo_path,
-                    simple_logo_path: config.simple_logo_path,
                     serial_handler: Arc::new(SerialHandler::new()),
                 }))
                 .with_graceful_shutdown(shutdown_signal())
                 .await
                 .unwrap();
         },
-        Ok(Some(args::Command::Help) | None) =>
-        {
+        Ok(Some(args::Command::Help) | None) => {
             show_help();
         },
-        Err(error) =>
-        {
+        Err(error) => {
             eprintln!("{Error} {error}.");
         },
     }

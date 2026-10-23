@@ -2,23 +2,19 @@ use std::fmt;
 
 macro_rules! impl_as_str
 {
-    ( $( $( #[ $meta:meta ] )* $name:ident = $str:expr ),* $(,)? ) =>
-    {
+    ($($(#[$meta:meta])* $name:ident = $str:expr),*$(,)?) => {
         $(
             $( #[ $meta ] )*
             #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
             pub struct $name;
 
-            impl $name
-            {
+            impl $name {
                 #[allow(unused)]
                 pub const fn as_str(&self) -> &'static str { $str }
             }
 
-            impl fmt::Display for $name
-            {
-                fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result
-                {
+            impl fmt::Display for $name {
+                fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
                     f.write_str(self.as_str())
                 }
             }
@@ -26,8 +22,7 @@ macro_rules! impl_as_str
     };
 }
 
-impl_as_str!
-{
+impl_as_str! {
     #[allow(unused)]
     Info = "\x1B[36m???\x1B[0m",
     Success = "\x1B[32m>>>\x1B[0m",
