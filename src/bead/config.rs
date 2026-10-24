@@ -1,24 +1,39 @@
+use std::borrow::Cow;
 use std::{fmt, slice};
 
-use crate::de::{self, Array, Quoted, is_literal_char, is_whitespace};
+use crate::de::{self, Array, Literal, Quoted, walk_whitespace};
+use crate::im::Ash;
 
 use super::{PinFlags};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct BeadConfig {
-    model: String,
-    pins: Vec<PinConfig>,
+pub struct BeadConfig<'a> {
+    model: Ash<'a, str>,
+    pins: Cow<'a, [PinConfig<'a>]>,
 }
 
-impl fmt::Display for BeadConfig {
+impl BeadConfig<'_> {
+    pub fn into_static<'a>(self) -> BeadConfig<'a> {
+        let BeadConfig { model, pins } = self;
+        BeadConfig {
+            model: model.into_static(),
+            pins: match pins {
+                Cow::Borrowed(borrowed) => borrowed.into_iter().map(|x| x.clone().into_static()).collect(),
+                Cow::Owned(owned) => owned.into_iter().map(|x| x.into_static()).collect(),
+            },
+        }
+    }
+}
+
+impl fmt::Display for BeadConfig<'_> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(
             f,
-            "{{ model: {}, pins: [{}] }}",
+            "{{ model: \"{}\", pins: [{}] }}",
             self.model,
             fmt::from_fn(|f| {
                 let mut first = true;
-                for pin in &self.pins {
+                for pin in self.pins.iter() {
                     if first {
                         first = false;
                     } else {
@@ -31,308 +46,243 @@ impl fmt::Display for BeadConfig {
     }
 }
 
-impl de::Deserialize<'_> for BeadConfig {
+impl<'a> de::Deserialize<'a> for BeadConfig<'a> {
     type Error = ();
 
-    fn deserialize_over(source: &mut slice::Iter<'_, u8>, whitespace: bool) -> Result<Self, Self::Error> {
+    fn deserialize_over(source: &mut slice::Iter<'a, u8>, whitespace: bool) -> Result<Self, Self::Error> {
         Option::deserialize_over(source, whitespace).and_then(|x| x.ok_or(()))
     }
 }
 
-impl de::Deserialize<'_> for Option<BeadConfig> {
+impl<'a> de::Deserialize<'a> for Option<BeadConfig<'a>> {
     type Error = ();
 
-    fn deserialize_over(source: &mut slice::Iter<'_, u8>, whitespace: bool) -> Result<Self, Self::Error> {
+    fn deserialize_over(source: &mut slice::Iter<'a, u8>, whitespace: bool) -> Result<Self, Self::Error> {
         if whitespace {
-            loop {
-                let undo = source.clone();
-                if !source.next().copied().is_none_or(is_whitespace) {
-                    *source = undo;
-                    break;
-                }
-            }
+            walk_whitespace(source);
         }
 
         let undo = source.clone();
-        match source.next() {
-            Some(b'{') => {
-                let mut model = None;
-                let mut pins = None;
-
-                loop {
-                    if whitespace {
-                        loop {
-                            let undo = source.clone();
-                            if !source.next().copied().is_none_or(is_whitespace) {
-                                *source = undo;
-                                break;
-                            }
-                        }
-                    }
-
-                    match source.as_slice() {
-                        [b'm', b'o', b'd', b'e', b'l', rest @ ..]
-                        | [b'\"', b'm', b'o', b'd', b'e', b'l', b'\"', rest @ ..]
-                        | [b'\'', b'm', b'o', b'd', b'e', b'l', b'\'', rest @ ..]
-                        if model.is_none()
-                            && !rest.first().copied().is_some_and(is_literal_char) =>
-                        {
-                            *source = rest.iter();
-
-                            if whitespace {
-                                loop {
-                                    let undo = source.clone();
-                                    if !source.next().copied().is_none_or(is_whitespace) {
-                                        *source = undo;
-                                        break;
-                                    }
-                                }
-                            }
-
-                            let undo = source.clone();
-                            match source.next() {
-                                Some(b':') => { },
-                                _ => {
-                                    *source = undo;
-                                    break;
-                                }
-                            }
-
-                            model = Some(Quoted::deserialize_over(source, whitespace)?.0);
-                        },
-                        [b'p', b'i', b'n', b's', rest @ ..]
-                        | [b'\"', b'p', b'i', b'n', b's', b'\"', rest @ ..]
-                        | [b'\'', b'p', b'i', b'n', b's', b'\'', rest @ ..]
-                        if pins.is_none()
-                            && !rest.first().copied().is_some_and(is_literal_char) =>
-                        {
-                            *source = rest.iter();
-
-                            if whitespace {
-                                loop {
-                                    let undo = source.clone();
-                                    if !source.next().copied().is_none_or(is_whitespace) {
-                                        *source = undo;
-                                        break;
-                                    }
-                                }
-                            }
-
-                            let undo = source.clone();
-                            match source.next() {
-                                Some(b':') => { },
-                                _ => {
-                                    *source = undo;
-                                    break;
-                                }
-                            }
-
-                            pins = Some(Array::deserialize_over(source, whitespace)?.0);
-                        },
-                        [b'}', rest @ ..]
-                        if model.is_some() && pins.is_some() => {
-                            *source = rest.iter();
-                            break;
-                        },
-                        _ => {
-                            return Err(())
-                        },
-                    }
-
-                    if whitespace {
-                        loop {
-                            let undo = source.clone();
-                            if !source.next().copied().is_none_or(is_whitespace) {
-                                *source = undo;
-                                break;
-                            }
-                        }
-                    }
-
-                    let undo = source.clone();
-                    match source.next() {
-                        Some(b',') => {
-                            continue;
-                        },
-                        Some(b'}')
-                        if model.is_some() && pins.is_some() => {
-                            break;
-                        },
-                        _ => {
-                            *source = undo;
-                            return Err(())
-                        },
-                    }
+        match Option::deserialize_over(source, whitespace)? {
+            None => return Ok(None),
+            Some(Literal(b'{')) => {
+                if whitespace {
+                    walk_whitespace(source);
                 }
 
-                Ok(Some(BeadConfig {
-                    model: model.unwrap(),
-                    pins: pins.unwrap(),
-                }))
+                let undo = source.clone();
+                let Literal::<&[u8]>(b"model") = Literal::deserialize_over(source, whitespace)? else {
+                    *source = undo;
+                    return Err(());
+                };
+
+                if whitespace {
+                    walk_whitespace(source);
+                }
+
+                let undo = source.clone();
+                let Some(b':') = source.next() else {
+                    *source = undo;
+                    return Err(());
+                };
+
+                if whitespace {
+                    walk_whitespace(source);
+                }
+
+                let Quoted(model) = Quoted::deserialize_over(source, whitespace)?;
+
+                if whitespace {
+                    walk_whitespace(source);
+                }
+
+                let undo = source.clone();
+                let Some(b',') = source.next() else {
+                    *source = undo;
+                    return Err(());
+                };
+
+                if whitespace {
+                    walk_whitespace(source);
+                }
+
+                let undo = source.clone();
+                let Literal::<&[u8]>(b"pins") = Literal::deserialize_over(source, whitespace)? else {
+                    *source = undo;
+                    return Err(());
+                };
+
+                if whitespace {
+                    walk_whitespace(source);
+                }
+
+                let undo = source.clone();
+                let Some(b':') = source.next() else {
+                    *source = undo;
+                    return Err(());
+                };
+
+                if whitespace {
+                    walk_whitespace(source);
+                }
+
+                let Array(pins) = Array::deserialize_over(source, whitespace)?;
+
+                if whitespace {
+                    walk_whitespace(source);
+                }
+
+                let undo = source.clone();
+                if let Some(b',') = source.next() {
+                    if whitespace {
+                        walk_whitespace(source);
+                    }
+                } else {
+                    *source = undo;
+                }
+
+                let undo = source.clone();
+                let Some(b'}') = source.next() else {
+                    *source = undo;
+                    return Err(());
+                };
+
+                Ok(Some(BeadConfig { model, pins }))
             },
-            _ => {
+            Some(_) => {
                 *source = undo;
-                Ok(None)
-            }
+                Err(())
+            },
         }
     }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct PinConfig {
-    name: String,
+pub struct PinConfig<'a> {
+    name: Ash<'a, str>,
     flags: PinFlags,
 }
 
-impl fmt::Display for PinConfig {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{{ name: {}, flags: {} }}", self.name, self.flags)
+impl PinConfig<'_> {
+    pub fn into_static<'a>(self) -> PinConfig<'a> {
+        let PinConfig { name, flags } = self;
+        PinConfig { name: name.into_static(), flags }
     }
 }
 
-impl de::Deserialize<'_> for PinConfig {
+impl fmt::Display for PinConfig<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{{ name: \"{}\", flags: {} }}", self.name, self.flags)
+    }
+}
+
+impl<'a> de::Deserialize<'a> for PinConfig<'a> {
     type Error = ();
 
-    fn deserialize_over(source: &mut slice::Iter<'_, u8>, whitespace: bool) -> Result<Self, Self::Error> {
+    fn deserialize_over(source: &mut slice::Iter<'a, u8>, whitespace: bool) -> Result<Self, Self::Error> {
         Option::deserialize_over(source, whitespace).and_then(|x| x.ok_or(()))
     }
 }
 
-impl de::Deserialize<'_> for Option<PinConfig> {
+impl<'a> de::Deserialize<'a> for Option<PinConfig<'a>> {
     type Error = ();
 
-    fn deserialize_over(source: &mut slice::Iter<'_, u8>, whitespace: bool) -> Result<Self, Self::Error> {
+    fn deserialize_over(source: &mut slice::Iter<'a, u8>, whitespace: bool) -> Result<Self, Self::Error> {
         if whitespace {
-            loop {
-                let undo = source.clone();
-                if !source.next().copied().is_none_or(is_whitespace) {
-                    *source = undo;
-                    break;
-                }
-            }
+            walk_whitespace(source);
         }
 
         let undo = source.clone();
-        match source.next() {
-            Some(b'{') => {
-                let mut name = None;
-                let mut flags = None;
-
-                loop {
-                    if whitespace {
-                        loop {
-                            let undo = source.clone();
-                            if !source.next().copied().is_none_or(is_whitespace) {
-                                *source = undo;
-                                break;
-                            }
-                        }
-                    }
-
-                    match source.as_slice() {
-                        [b'n', b'a', b'm', b'e', rest @ ..]
-                        | [b'\"', b'n', b'a', b'm', b'e', b'\"', rest @ ..]
-                        | [b'\'', b'n', b'a', b'm', b'e', b'\'', rest @ ..]
-                        if name.is_none()
-                            && !rest.first().copied().is_some_and(is_literal_char) =>
-                        {
-                            *source = rest.iter();
-
-                            if whitespace {
-                                loop {
-                                    let undo = source.clone();
-                                    if !source.next().copied().is_none_or(is_whitespace) {
-                                        *source = undo;
-                                        break;
-                                    }
-                                }
-                            }
-
-                            let undo = source.clone();
-                            match source.next() {
-                                Some(b':') => { },
-                                _ => {
-                                    *source = undo;
-                                    break;
-                                }
-                            }
-
-                            name = Some(Quoted::deserialize_over(source, whitespace)?.0);
-                        },
-                        [b'p', b'i', b'n', b's', rest @ ..]
-                        | [b'\"', b'p', b'i', b'n', b's', b'\"', rest @ ..]
-                        | [b'\'', b'p', b'i', b'n', b's', b'\'', rest @ ..]
-                        if flags.is_none()
-                            && !rest.first().copied().is_some_and(is_literal_char) =>
-                        {
-                            *source = rest.iter();
-
-                            if whitespace {
-                                loop {
-                                    let undo = source.clone();
-                                    if !source.next().copied().is_none_or(is_whitespace) {
-                                        *source = undo;
-                                        break;
-                                    }
-                                }
-                            }
-
-                            let undo = source.clone();
-                            match source.next() {
-                                Some(b':') => { },
-                                _ => {
-                                    *source = undo;
-                                    break;
-                                }
-                            }
-
-                            flags = Some(PinFlags::deserialize_over(source, whitespace)?);
-                        },
-                        [b'}', rest @ ..]
-                        if name.is_some() && flags.is_some() => {
-                            *source = rest.iter();
-                            break;
-                        },
-                        _ => {
-                            return Err(())
-                        },
-                    }
-
-                    if whitespace {
-                        loop {
-                            let undo = source.clone();
-                            if !source.next().copied().is_none_or(is_whitespace) {
-                                *source = undo;
-                                break;
-                            }
-                        }
-                    }
-
-                    let undo = source.clone();
-                    match source.next() {
-                        Some(b',') => {
-                            continue;
-                        },
-                        Some(b'}')
-                        if name.is_some() && flags.is_some() => {
-                            break;
-                        },
-                        _ => {
-                            *source = undo;
-                            return Err(())
-                        },
-                    }
+        match Option::deserialize_over(source, whitespace)? {
+            None => return Ok(None),
+            Some(Literal(b'{')) => {
+                if whitespace {
+                    walk_whitespace(source);
                 }
 
-                Ok(Some(PinConfig {
-                    name: name.unwrap(),
-                    flags: flags.unwrap(),
-                }))
+                let undo = source.clone();
+                let Literal::<&[u8]>(b"name") = Literal::deserialize_over(source, whitespace)? else {
+                    *source = undo;
+                    return Err(());
+                };
+
+                if whitespace {
+                    walk_whitespace(source);
+                }
+
+                let undo = source.clone();
+                let Some(b':') = source.next() else {
+                    *source = undo;
+                    return Err(());
+                };
+
+                if whitespace {
+                    walk_whitespace(source);
+                }
+
+                let Quoted(name) = Quoted::deserialize_over(source, whitespace)?;
+
+                if whitespace {
+                    walk_whitespace(source);
+                }
+
+                let undo = source.clone();
+                let Some(b',') = source.next() else {
+                    *source = undo;
+                    return Err(());
+                };
+
+                if whitespace {
+                    walk_whitespace(source);
+                }
+
+                let undo = source.clone();
+                let Literal::<&[u8]>(b"flags") = Literal::deserialize_over(source, whitespace)? else {
+                    *source = undo;
+                    return Err(());
+                };
+
+                if whitespace {
+                    walk_whitespace(source);
+                }
+
+                let undo = source.clone();
+                let Some(b':') = source.next() else {
+                    *source = undo;
+                    return Err(());
+                };
+
+                if whitespace {
+                    walk_whitespace(source);
+                }
+
+                let flags = PinFlags::deserialize_over(source, whitespace)?;
+
+                if whitespace {
+                    walk_whitespace(source);
+                }
+
+                let undo = source.clone();
+                if let Some(b',') = source.next() {
+                    if whitespace {
+                        walk_whitespace(source);
+                    }
+                } else {
+                    *source = undo;
+                }
+
+                let undo = source.clone();
+                let Some(b'}') = source.next() else {
+                    *source = undo;
+                    return Err(());
+                };
+
+                Ok(Some(PinConfig { name, flags }))
             },
-            _ => {
+            Some(_) => {
                 *source = undo;
-                Ok(None)
-            }
+                Err(())
+            },
         }
     }
 }

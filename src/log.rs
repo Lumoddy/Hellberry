@@ -29,6 +29,7 @@ impl_as_str! {
     Warn = "\x1B[33m/!\\\x1B[0m",
     Error = "\x1B[31m{!}\x1B[0m",
     ANSIReset = "\x1B[0m",
+    ANSIRed = "\x1B[31m",
     ANSIYellow = "\x1B[33m",
     ANSICyan = "\x1B[36m",
     ANSIPurple = "\x1B[35m",

@@ -1,18 +1,16 @@
 use std::borrow::Cow;
 use std::{fmt, slice};
 
+use crate::im::Ash;
+
 pub const fn is_literal_char(byte: u8) -> bool {
     matches!(byte, b'0'..=b'9' | b'A'..=b'Z' | b'a'..=b'z' | b'_')
-}
-
-pub const fn is_whitespace(byte: u8) -> bool {
-    matches!(byte, b' ' | b'\t')
 }
 
 pub fn walk_whitespace(source: &mut slice::Iter<'_, u8>) {
     loop {
         let undo = source.clone();
-        if !source.next().copied().is_none_or(is_whitespace) {
+        if !source.next().is_none_or(u8::is_ascii_whitespace) {
             *source = undo;
             break;
         }
@@ -23,11 +21,12 @@ pub trait Deserialize<'a>: Sized {
     type Error: Default;
 
     fn deserialize(source: impl IntoIterator<IntoIter = slice::Iter<'a, u8>>)
-        -> Result<Self, Self::Error> {
+        -> Result<Self, (usize, Self::Error)> {
         let mut iter = source.into_iter();
-        let value = Self::deserialize_over(&mut iter, true)?;
+        let source = iter.clone();
+        let value = Self::deserialize_over(&mut iter, true).map_err(|x| (source.len() - iter.len(), x))?;
         for byte in iter {
-            if !is_whitespace(*byte) {
+            if !u8::is_ascii_whitespace(byte) {
                 return Err(<_>::default());
             }
         }
@@ -45,15 +44,10 @@ macro_rules! impl_int {
 
                 fn deserialize_over(source: &mut slice::Iter<'_, u8>, whitespace: bool) -> Result<Self, Self::Error> {
                     if whitespace {
-                        loop {
-                            let undo = source.clone();
-                            if !source.next().copied().is_none_or(is_whitespace) {
-                                *source = undo;
-                                break;
-                            }
-                        }
+                        walk_whitespace(source);
                     }
 
+                    let undo_all = source.clone();
                     let mut buffer = [0u8; $size];
                     let mut i = 0;
                     let mut is_first = true;
@@ -61,9 +55,6 @@ macro_rules! impl_int {
                     loop {
                         let undo = source.clone();
                         match source.next() {
-                            Some(b'_') => {
-                                is_first = false;
-                            },
                             Some(&byte @ (b'0'..=b'9' | b'-')) if byte != b'-' || is_first => {
                                 if i >= buffer.len() {
                                     return Err(());
@@ -72,7 +63,7 @@ macro_rules! impl_int {
                                 buffer[i] = byte;
                                 i += 1;
                             },
-                            _ if is_first => {
+                            Some(&byte) if is_first || is_literal_char(byte) => {
                                 return Ok(None);
                             },
                             _ => {
@@ -84,7 +75,10 @@ macro_rules! impl_int {
 
                     match core::str::from_utf8(&buffer[..i]).unwrap().parse::<$ty>() {
                         Ok(value) => Ok(Some(value)),
-                        Err(_) => Err(()),
+                        Err(_) => {
+                            *source = undo_all;
+                            Err(())
+                        },
                     }
                 }
             }
@@ -100,7 +94,67 @@ macro_rules! impl_int {
     };
 }
 
-impl_int!(u8: 3, u16: 5, u32: 10, u64: 20, u128: 39, i8: 4, i16: 6, i32: 11, i64: 20, i128: 40);
+impl_int!(u8: 3, u16: 5, u32: 10, u64: 20, u128: 39, i8: 4, i16: 6, i32: 11, i64: 20, i128: 40, isize: 20, usize: 20);
+
+impl<'a> Deserialize<'a> for f32 {
+    type Error = ();
+
+    fn deserialize_over(source: &mut slice::Iter<'a, u8>, whitespace: bool) -> Result<Self, Self::Error> {
+        Option::deserialize_over(source, whitespace).and_then(|x| x.ok_or(()))
+    }
+}
+
+impl<'a> Deserialize<'a> for Option<f32> {
+    type Error = ();
+
+    fn deserialize_over(source: &mut slice::Iter<'a, u8>, whitespace: bool) -> Result<Self, Self::Error> {
+        if whitespace {
+            walk_whitespace(source);
+        }
+
+        let undo_all = source.clone();
+        let mut buffer = [0u8; 64];
+        let mut i = 0;
+        let mut is_first = true;
+
+        loop {
+            let undo = source.clone();
+            match source.next() {
+                Some(&byte @ (b'0'..=b'9' | b'-' | b'.' | b'e' | b'E')) if byte != b'-' || is_first => {
+                    if i >= buffer.len() {
+                        return Err(());
+                    }
+                    is_first = false;
+                    buffer[i] = byte;
+                    i += 1;
+                },
+                Some(&byte) if is_first || is_literal_char(byte) => {
+                    return Ok(None);
+                },
+                _ => {
+                    *source = undo;
+                    break;
+                },
+            }
+        }
+
+        match core::str::from_utf8(&buffer[..i]).unwrap().parse::<f32>() {
+            Ok(value) => Ok(Some(value)),
+            Err(_) => {
+                *source = undo_all;
+                Err(())
+            },
+        }
+    }
+}
+
+impl<'a> Deserialize<'a> for bool {
+    type Error = ();
+
+    fn deserialize_over(source: &mut slice::Iter<'a, u8>, whitespace: bool) -> Result<Self, Self::Error> {
+        Option::deserialize_over(source, whitespace).and_then(|x| x.ok_or(()))
+    }
+}
 
 impl<'a> Deserialize<'a> for Option<bool> {
     type Error = ();
@@ -116,14 +170,6 @@ impl<'a> Deserialize<'a> for Option<bool> {
                 Err(())
             },
         }
-    }
-}
-
-impl<'a> Deserialize<'a> for bool {
-    type Error = ();
-
-    fn deserialize_over(source: &mut slice::Iter<'a, u8>, whitespace: bool) -> Result<Self, Self::Error> {
-        Option::deserialize_over(source, whitespace).and_then(|x| x.ok_or(()))
     }
 }
 
@@ -146,6 +192,15 @@ impl<'a> Deserialize<'a> for Literal<Vec<u8>> {
 }
 
 impl<'a> Deserialize<'a> for Literal<Cow<'a, [u8]>> {
+    type Error = ();
+
+    fn deserialize_over(source: &mut slice::Iter<'a, u8>, whitespace: bool) -> Result<Self, Self::Error> {
+        Literal::deserialize_over(source, whitespace)
+            .map(|Literal(x)| Literal(<&[u8]>::into(x)))
+    }
+}
+
+impl<'a> Deserialize<'a> for Literal<Ash<'a, [u8]>> {
     type Error = ();
 
     fn deserialize_over(source: &mut slice::Iter<'a, u8>, whitespace: bool) -> Result<Self, Self::Error> {
@@ -182,6 +237,16 @@ impl<'a> Deserialize<'a> for Option<Literal<Cow<'a, [u8]>>> {
     }
 }
 
+impl<'a> Deserialize<'a> for Option<Literal<Ash<'a, [u8]>>> {
+    type Error = ();
+
+    fn deserialize_over(source: &mut slice::Iter<'a, u8>, whitespace: bool) -> Result<Self, Self::Error> {
+        Option::deserialize_over(source, whitespace)
+            .map(|x| x
+                .map(|Literal(x)| Literal(<&[u8]>::into(x))))
+    }
+}
+
 impl<'a> Deserialize<'a> for Option<Literal<&'a [u8]>> {
     type Error = ();
 
@@ -193,8 +258,8 @@ impl<'a> Deserialize<'a> for Option<Literal<&'a [u8]>> {
         let undo = source.clone();
         match source.next() {
             Some(&byte) if is_literal_char(byte) => {
-                let value = source.as_slice();
-                let mut count = 0;
+                let value = undo.as_slice();
+                let mut count = 1;
                 loop {
                     let undo = source.clone();
                     match source.next() {
@@ -235,6 +300,15 @@ impl<'a> Deserialize<'a> for Literal<Cow<'a, str>> {
     }
 }
 
+impl<'a> Deserialize<'a> for Literal<Ash<'a, str>> {
+    type Error = ();
+
+    fn deserialize_over(source: &mut slice::Iter<'a, u8>, whitespace: bool) -> Result<Self, Self::Error> {
+        Literal::deserialize_over(source, whitespace)
+            .map(|Literal(x)| Literal(<&str>::into(x)))
+    }
+}
+
 impl<'a> Deserialize<'a> for Literal<&'a str> {
     type Error = ();
 
@@ -255,6 +329,16 @@ impl Deserialize<'_> for Option<Literal<String>> {
 }
 
 impl<'a> Deserialize<'a> for Option<Literal<Cow<'a, str>>> {
+    type Error = ();
+
+    fn deserialize_over(source: &mut slice::Iter<'a, u8>, whitespace: bool) -> Result<Self, Self::Error> {
+        Option::deserialize_over(source, whitespace)
+            .map(|x| x
+                .map(|Literal(x)| Literal(<&str>::into(x))))
+    }
+}
+
+impl<'a> Deserialize<'a> for Option<Literal<Ash<'a, str>>> {
     type Error = ();
 
     fn deserialize_over(source: &mut slice::Iter<'a, u8>, whitespace: bool) -> Result<Self, Self::Error> {
@@ -322,6 +406,15 @@ impl<'a> Deserialize<'a> for Quoted<Cow<'a, [u8]>> {
     }
 }
 
+impl<'a> Deserialize<'a> for Quoted<Ash<'a, [u8]>> {
+    type Error = ();
+
+    fn deserialize_over(source: &mut slice::Iter<'a, u8>, whitespace: bool) -> Result<Self, Self::Error> {
+        Quoted::deserialize_over(source, whitespace)
+            .map(|Quoted(x)| Quoted(<&[u8]>::into(x)))
+    }
+}
+
 impl<'a> Deserialize<'a> for Quoted<&'a [u8]> {
     type Error = ();
 
@@ -341,6 +434,16 @@ impl Deserialize<'_> for Option<Quoted<Vec<u8>>> {
 }
 
 impl<'a> Deserialize<'a> for Option<Quoted<Cow<'a, [u8]>>> {
+    type Error = ();
+
+    fn deserialize_over(source: &mut slice::Iter<'a, u8>, whitespace: bool) -> Result<Self, Self::Error> {
+        Option::deserialize_over(source, whitespace)
+            .map(|x| x
+                .map(|Quoted(x)| Quoted(<&[u8]>::into(x))))
+    }
+}
+
+impl<'a> Deserialize<'a> for Option<Quoted<Ash<'a, [u8]>>> {
     type Error = ();
 
     fn deserialize_over(source: &mut slice::Iter<'a, u8>, whitespace: bool) -> Result<Self, Self::Error> {
@@ -406,6 +509,15 @@ impl<'a> Deserialize<'a> for Quoted<Cow<'a, str>> {
     }
 }
 
+impl<'a> Deserialize<'a> for Quoted<Ash<'a, str>> {
+    type Error = ();
+
+    fn deserialize_over(source: &mut slice::Iter<'a, u8>, whitespace: bool) -> Result<Self, Self::Error> {
+        Quoted::deserialize_over(source, whitespace)
+            .map(|Quoted(x)| Quoted(<&str>::into(x)))
+    }
+}
+
 impl<'a> Deserialize<'a> for Quoted<&'a str> {
     type Error = ();
 
@@ -426,6 +538,16 @@ impl Deserialize<'_> for Option<Quoted<String>> {
 }
 
 impl<'a> Deserialize<'a> for Option<Quoted<Cow<'a, str>>> {
+    type Error = ();
+
+    fn deserialize_over(source: &mut slice::Iter<'a, u8>, whitespace: bool) -> Result<Self, Self::Error> {
+        Option::deserialize_over(source, whitespace)
+            .map(|x| x
+                .map(|Quoted(x)| Quoted(<&str>::into(x))))
+    }
+}
+
+impl<'a> Deserialize<'a> for Option<Quoted<Ash<'a, str>>> {
     type Error = ();
 
     fn deserialize_over(source: &mut slice::Iter<'a, u8>, whitespace: bool) -> Result<Self, Self::Error> {
@@ -621,5 +743,27 @@ impl<'a, T: Deserialize<'a>> Deserialize<'a> for Option<Array<Vec<T>>> {
                 Ok(None)
             },
         }
+    }
+}
+
+impl<'a, T: Deserialize<'a>> Deserialize<'a> for Array<Cow<'_, [T]>>
+where
+    [T]: ToOwned<Owned = Vec<T>>,
+{
+    type Error = T::Error;
+
+    fn deserialize_over(source: &mut slice::Iter<'a, u8>, whitespace: bool) -> Result<Self, Self::Error> {
+        Option::deserialize_over(source, whitespace).and_then(|x| x.ok_or_else(<_>::default))
+    }
+}
+
+impl<'a, T: Deserialize<'a>> Deserialize<'a> for Option<Array<Cow<'_, [T]>>>
+where
+    [T]: ToOwned<Owned = Vec<T>>,
+{
+    type Error = T::Error;
+
+    fn deserialize_over(source: &mut slice::Iter<'a, u8>, whitespace: bool) -> Result<Self, Self::Error> {
+        Option::deserialize_over(source, whitespace).map(|x| x.map(|Array(x)| Array(Cow::Owned(x))))
     }
 }

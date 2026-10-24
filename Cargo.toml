@@ -13,3 +13,4 @@ tokio-serial = "5.5.0"
 mime-type = "0.2.1"
 bitflags = "2.13.2"
 tower-http = "0.7.1"
+serde = { version = "1.0.229", features = ["derive"] }

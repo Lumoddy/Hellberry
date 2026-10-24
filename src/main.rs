@@ -1,20 +1,24 @@
 use axum::routing;
 use bead::SerialHandler;
 use router::Router;
-use tokio::time::interval;
+use tokio::time::{MissedTickBehavior, interval};
 use tokio::{select, signal};
 use tokio::net::{TcpListener, UdpSocket};
 
 use std::ffi::OsString;
-use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
+use std::net::{Ipv4Addr, SocketAddr};
 use std::sync::Arc;
 use std::time::Duration;
+
+mod im;
 
 mod args;
 
 mod de;
 
 mod bead;
+
+mod packet;
 
 mod router;
 
@@ -27,14 +31,13 @@ use log::*;
 async fn main() {
     match args::parse_args(std::env::args_os().skip(1).map(OsString::into_encoded_bytes)) {
         Ok(Some(args::Command::Run { listen_port, broadcast_port, berry_name })) => {
-            let local_broadcast_ip = local_ip_address::local_broadcast_ip().unwrap();
             let local_ip = local_ip_address::local_ip().unwrap();
 
             let listen_port = listen_port.unwrap_or(0);
             let broadcast_port = broadcast_port.unwrap_or(0);
 
-            let listener = match TcpListener::bind(SocketAddrV4::new(
-                Ipv4Addr::new(0, 0, 0, 0),
+            let listener = match TcpListener::bind(SocketAddr::new(
+                Ipv4Addr::UNSPECIFIED.into(),
                 listen_port)).await
             {
                 Ok(x) => x,
@@ -46,8 +49,8 @@ async fn main() {
 
             eprintln!("{Success} Started listening on {}.", listener.local_addr().unwrap());
 
-            let broadcaster = match UdpSocket::bind(SocketAddrV4::new(
-                Ipv4Addr::new(0, 0, 0, 0),
+            let broadcaster = match UdpSocket::bind(SocketAddr::new(
+                Ipv4Addr::UNSPECIFIED.into(),
                 0)).await
             {
                 Ok(x) => x,
@@ -60,7 +63,7 @@ async fn main() {
             broadcaster.set_broadcast(true).unwrap();
 
             match broadcaster.connect(SocketAddr::new(
-                local_broadcast_ip,
+                Ipv4Addr::LOCALHOST.into(),
                 broadcast_port)).await
             {
                 Ok(x) => x,
@@ -102,11 +105,29 @@ async fn main() {
                 }
             });
 
+            let serial_handler = Arc::new(SerialHandler::new());
+
+            tokio::spawn({
+                let serial_handler = serial_handler.clone();
+                let mut interval = interval(Duration::from_millis(500));
+                interval.set_missed_tick_behavior(MissedTickBehavior::Delay);
+                async move {
+                    loop {
+                        select! {
+                            biased;
+
+                            () = shutdown_signal() => break,
+                            _ = interval.tick() => serial_handler.update().await,
+                        }
+                    }
+                }
+            });
+
             axum::serve(
                 listener,
                 routing::Router::from(Router {
                     config_name: berry_name,
-                    serial_handler: Arc::new(SerialHandler::new()),
+                    serial_handler,
                 }))
                 .with_graceful_shutdown(shutdown_signal())
                 .await
@@ -127,19 +148,11 @@ fn show_help()
 {Success} Relays the state of the connected \"Hellberry Beads\" (usually Arduinos) through a hosted http server with websocket support.
 
   {ANSICyan}run{ANSIReset} Starts the server.
-    {ANSIYellow}-listen -listen_port{ANSIReset} The port the http server will listen on.
-    {ANSIYellow}-broadcast -broadcast_port{ANSIReset} The port to broadcast to on the local network.
+    {ANSIYellow}-listen -listen-port{ANSIReset} The port the http server will listen on.
+    {ANSIYellow}-broadcast -broadcast-port{ANSIReset} The port to broadcast to on the local network.
     {ANSIYellow}-name -berry-name{ANSIReset} The name of this Hellberry.
 
   {ANSICyan}help{ANSIReset} Shows this help message.
-
-A config file at \'./config.json\' or \'./config.yaml\' can be used to specify more options:
-
-  {ANSIPurple}\"name\"{ANSIReset} The name of this Hellberry.
-  {ANSIPurple}\"logo-path\"{ANSIReset} The relative path to a logo image.
-  {ANSIPurple}\"simple-logo-path\"{ANSIReset} Single color version of the logo image.
-  {ANSIPurple}\"listen-port\"{ANSIReset} The port the http server will listen on.
-  {ANSIPurple}\"broadcast-port\"{ANSIReset} The port to broadcast to on the local network.
 ");
 }
 
