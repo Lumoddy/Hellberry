@@ -1,254 +1,233 @@
-use std::{fmt, slice};
+use std::slice;
 
-use crate::bead::{PinConfig, PinFlags, PinMode};
-use crate::de::{self, Field, Literal, walk_whitespace};
+use crate::bead::{PinFlags, PinMode};
 
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum Packet
-{
-    /// Encoded as `"pong"`.
-    Pong,
-    /// Encoded as `"pins.{pin}.power = {power}"`.
-    PinPowerResponse { pin: String, power: u16 },
-    /// Encoded as `"pins.{pin}.mode = {mode}"`.
-    PinModeResponse { pin: String, mode: PinMode },
-    /// Encoded as `"pins.{pin}.flags = {flags}"`.
-    PinFlagsResponse { pin: String, flags: PinFlags },
-    /// Encoded as `"error.malformedPacketAt(<pos>)"`.
-    MalformedPacket { pos: usize },
-    /// Encoded as `"pins.{pin}.error.unsupportedMode({mode})"`.
-    UnsupportedPinMode { pin: String, mode: PinMode },
-    /// Encoded as `"pins.{pin}.error.getPowerDenied()"`.
-    PinGetPowerDenied { pin: String },
-    /// Encoded as `"pins.{pin}.error.setPowerDenied()"`.
-    PinSetPowerDenied { pin: String },
-    /// Encoded as `"config = { model: <model>, pins: [{ name: <name>, flags: <flags> }, ...] }`.
-    Config { config: PinConfig },
+#[derive(Clone, Debug)]
+pub enum Response<'a> {
+    Empty(),
+    Config { model: &'a str, pins: PinConfigIter<'a> },
+    Power(u16),
+    Mode(PinMode),
+    Flags(PinFlags),
+    NACK { message: &'a str },
+    Panic { line: u32, column: u32, file: &'a str },
 }
 
-impl fmt::Display for Packet {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::Pong => write!(f, "pong"),
-            Self::PinPowerResponse { pin, power } => write!(f, "pins.{pin}.power = {power}"),
-            Self::PinModeResponse { pin, mode } => write!(f, "pins.{pin}.mode = {mode}"),
-            Self::PinFlagsResponse { pin, flags } => write!(f, "pins.{pin}.flags = {flags}"),
-            Self::MalformedPacket { pos } => write!(f, "error.malformedPacketAt({pos})"),
-            Self::UnsupportedPinMode { pin, mode } => write!(f, "pins.{pin}.error.unsupportedMode({mode})"),
-            Self::PinGetPowerDenied { pin } => write!(f, "pins.{pin}.error.getPowerDenied()"),
-            Self::PinSetPowerDenied { pin } => write!(f, "pins.{pin}.error.setPowerDenied()"),
-            Self::Config { config } => write!(f, "config = {config}"),
-        }
+#[derive(Clone, Copy, Debug, PartialEq, PartialOrd)]
+pub enum Error {
+    UnexpectedEndOfPacket,
+    UnexpectedExcessData,
+    UnsupportedVersion,
+    InvalidPinMode,
+    InvalidUTF8,
+    InvalidPacketId,
+}
+
+pub fn deserialize(payload: &[u8]) -> Result<Response<'_>, Error> {
+    match payload {
+        [0, rest @ ..] => {
+            if !rest.is_empty() {
+                return Err(Error::UnexpectedExcessData);
+            };
+
+            Ok(Response::Empty())
+        },
+        [1, rest @ ..] => {
+            let [version, rest @ ..] = rest else {
+                return Err(Error::UnexpectedEndOfPacket);
+            };
+
+            if *version != 1 {
+                return Err(Error::UnsupportedVersion);
+            }
+
+            let [len, rest @ ..] = rest else {
+                return Err(Error::UnexpectedEndOfPacket);
+            };
+
+            let Some((model, rest)) = rest.split_at_checked(*len as usize) else {
+                return Err(Error::UnexpectedEndOfPacket);
+            };
+
+            let Ok(model) = str::from_utf8(model) else {
+                return Err(Error::InvalidUTF8);
+            };
+
+            let (pins, rest) = PinConfigIter::walk(rest)?;
+
+            if !rest.is_empty() {
+                return Err(Error::UnexpectedExcessData);
+            };
+
+            Ok(Response::Config { model, pins })
+        },
+        [2, rest @ ..] => {
+            let [byte0, byte1, rest @ ..] = rest else {
+                return Err(Error::UnexpectedEndOfPacket);
+            };
+
+            let power = u16::from_be_bytes([*byte0, *byte1]);
+
+            if !rest.is_empty() {
+                return Err(Error::UnexpectedExcessData);
+            };
+
+            Ok(Response::Power(power))
+        },
+        [3, rest @ ..] => {
+            let [byte, rest @ ..] = rest else {
+                return Err(Error::UnexpectedEndOfPacket);
+            };
+
+            let Ok(mode) = PinMode::try_from(*byte) else {
+                return Err(Error::InvalidPinMode);
+            };
+
+            if !rest.is_empty() {
+                return Err(Error::UnexpectedExcessData);
+            };
+
+            Ok(Response::Mode(mode))
+        },
+        [4, rest @ ..] => {
+            let [byte, rest @ ..] = rest else {
+                return Err(Error::UnexpectedEndOfPacket);
+            };
+
+            let Ok(mode) = PinMode::try_from(*byte) else {
+                return Err(Error::InvalidPinMode);
+            };
+
+            if !rest.is_empty() {
+                return Err(Error::UnexpectedExcessData);
+            };
+
+            Ok(Response::Mode(mode))
+        },
+        [200, rest @ ..] => {
+            let [len, rest @ ..] = rest else {
+                return Err(Error::UnexpectedEndOfPacket);
+            };
+
+            let Some((message, rest)) = rest.split_at_checked(*len as usize) else {
+                return Err(Error::UnexpectedEndOfPacket);
+            };
+
+            let Ok(message) = str::from_utf8(message) else {
+                return Err(Error::InvalidUTF8);
+            };
+
+            if !rest.is_empty() {
+                return Err(Error::UnexpectedExcessData);
+            };
+
+            Ok(Response::NACK { message })
+        },
+        [255, rest @ ..] => {
+            let [byte0, byte1, byte2, byte3, rest @ ..] = rest else {
+                return Err(Error::UnexpectedEndOfPacket);
+            };
+
+            let line = u32::from_be_bytes([*byte0, *byte1, *byte2, *byte3]);
+
+            let [byte0, byte1, byte2, byte3, rest @ ..] = rest else {
+                return Err(Error::UnexpectedEndOfPacket);
+            };
+
+            let column = u32::from_be_bytes([*byte0, *byte1, *byte2, *byte3]);
+
+            let [len, rest @ ..] = rest else {
+                return Err(Error::UnexpectedEndOfPacket);
+            };
+
+            let Some((file, rest)) = rest.split_at_checked(*len as usize) else {
+                return Err(Error::UnexpectedEndOfPacket);
+            };
+
+            let Ok(file) = str::from_utf8(file) else {
+                return Err(Error::InvalidUTF8);
+            };
+
+            if !rest.is_empty() {
+                return Err(Error::UnexpectedExcessData);
+            };
+
+            Ok(Response::Panic { line, column, file })
+        },
+        [_, ..] => {
+            Err(Error::InvalidPacketId)
+        },
+        [] => {
+            Err(Error::UnexpectedEndOfPacket)
+        },
     }
 }
 
-impl de::Deserialize<'_> for Option<Packet> {
-    type Error = ();
+#[derive(Clone, Debug)]
+pub struct PinConfigIter<'a> {
+    inner: slice::Iter<'a, u8>,
+}
 
-    fn deserialize_over(source: &mut slice::Iter<'_, u8>, whitespace: bool) -> Result<Self, Self::Error> {
-        if whitespace {
-            walk_whitespace(source);
+impl<'a> PinConfigIter<'a> {
+    fn walk(rest: &'a [u8]) -> Result<(Self, &'a [u8]), Error> {
+        let [len, rest @ ..] = rest else {
+            return Err(Error::UnexpectedEndOfPacket);
+        };
+
+        let mut outer_rest = rest;
+
+        for _ in 0..*len {
+            let rest = outer_rest;
+
+            let [len, rest @ ..] = rest else {
+                return Err(Error::UnexpectedEndOfPacket);
+            };
+
+            let Some((name, rest)) = rest.split_at_checked(*len as usize) else {
+                return Err(Error::UnexpectedEndOfPacket);
+            };
+
+            let Ok(_) = str::from_utf8(name) else {
+                return Err(Error::InvalidUTF8);
+            };
+
+            let [_, rest @ ..] = rest else {
+                return Err(Error::UnexpectedEndOfPacket);
+            };
+
+            outer_rest = rest;
         }
 
-        let undo = source.clone();
-        Ok(match Option::deserialize_over(source, whitespace)? {
-            None => return Ok(None),
-            Some(Literal::<&[u8]>(b"pong")) => {
-                Some(Packet::Pong)
-            },
-            Some(Literal(b"config")) => {
-                if whitespace {
-                    walk_whitespace(source);
-                }
+        let iter_inner = &rest[..rest.len() - outer_rest.len()];
+        let rest = outer_rest;
 
-                let undo = source.clone();
-                let Literal(b'=') = Literal::deserialize_over(source, whitespace)? else {
-                    *source = undo;
-                    return Err(());
-                };
+        Ok((PinConfigIter { inner: iter_inner.iter() }, rest))
+    }
+}
 
-                if whitespace {
-                    walk_whitespace(source);
-                }
+impl<'a> Iterator for PinConfigIter<'a> {
+    type Item = (&'a str, PinFlags);
 
-                let config = PinConfig::deserialize_over(source, whitespace)?;
+    fn next(&mut self) -> Option<Self::Item> {
+        let rest = self.inner.as_slice();
 
-                Some(Packet::Config { config })
-            },
-            Some(Literal(b"pins")) => {
-                if whitespace {
-                    walk_whitespace(source);
-                }
+        let [len, rest @ ..] = rest else {
+            unreachable!();
+        };
 
-                let Field(Literal(pin)) = Field::deserialize_over(source, whitespace)?;
+        let Some((name, rest)) = rest.split_at_checked(*len as usize) else {
+            unreachable!();
+        };
 
-                if whitespace {
-                    walk_whitespace(source);
-                }
+        let [flags, rest @ ..] = rest else {
+            unreachable!();
+        };
 
-                let undo = source.clone();
-                match Field::deserialize_over(source, whitespace)? {
-                    Field(Literal::<&[u8]>(b"power")) => {
-                        if whitespace {
-                            walk_whitespace(source);
-                        }
+        let name = str::from_utf8(name).unwrap();
+        let flags = PinFlags::from_bits_truncate(*flags);
 
-                        let undo = source.clone();
-                        let Literal(b'=') = Literal::deserialize_over(source, whitespace)? else {
-                            *source = undo;
-                            return Err(());
-                        };
+        self.inner = rest.iter();
 
-                        if whitespace {
-                            walk_whitespace(source);
-                        }
-
-                        let power = u16::deserialize_over(source, whitespace)?;
-
-                        Some(Packet::PinPowerResponse { pin, power })
-                    },
-                    Field(Literal(b"mode")) => {
-                        if whitespace {
-                            walk_whitespace(source);
-                        }
-
-                        let undo = source.clone();
-                        let Literal(b'=') = Literal::deserialize_over(source, whitespace)? else {
-                            *source = undo;
-                            return Err(());
-                        };
-
-                        if whitespace {
-                            walk_whitespace(source);
-                        }
-
-                        let mode = PinMode::deserialize_over(source, whitespace)?;
-
-                        Some(Packet::PinModeResponse { pin, mode })
-                    },
-                    Field(Literal(b"flags")) => {
-                        if whitespace {
-                            walk_whitespace(source);
-                        }
-
-                        let undo = source.clone();
-                        let Literal(b'=') = Literal::deserialize_over(source, whitespace)? else {
-                            *source = undo;
-                            return Err(());
-                        };
-
-                        if whitespace {
-                            walk_whitespace(source);
-                        }
-
-                        let flags = PinFlags::deserialize_over(source, whitespace)?;
-
-                        Some(Packet::PinFlagsResponse { pin, flags })
-                    },
-                    Field(Literal(b"error")) => {
-                        if whitespace {
-                            walk_whitespace(source);
-                        }
-
-                        let undo = source.clone();
-                        match Field::deserialize_over(source, whitespace)? {
-                            Field(Literal::<&[u8]>(b"unsupportedMode")) => {
-                                if whitespace {
-                                    walk_whitespace(source);
-                                }
-
-                                let undo = source.clone();
-                                let Literal(b'(') = Literal::deserialize_over(source, whitespace)? else {
-                                    *source = undo;
-                                    return Err(());
-                                };
-
-                                if whitespace {
-                                    walk_whitespace(source);
-                                }
-
-                                let mode = PinMode::deserialize_over(source, whitespace)?;
-
-                                if whitespace {
-                                    walk_whitespace(source);
-                                }
-
-                                if let Literal(b',') = Literal::deserialize_over(source, whitespace)? {
-                                    if whitespace {
-                                        walk_whitespace(source);
-                                    }
-                                }
-
-                                let undo = source.clone();
-                                let Literal(b')') = Literal::deserialize_over(source, whitespace)? else {
-                                    *source = undo;
-                                    return Err(());
-                                };
-
-                                Some(Packet::UnsupportedPinMode { pin, mode })
-                            },
-                            Field(Literal(b"getPowerDenied")) => {
-                                if whitespace {
-                                    walk_whitespace(source);
-                                }
-
-                                let undo = source.clone();
-                                let Literal(b'(') = Literal::deserialize_over(source, whitespace)? else {
-                                    *source = undo;
-                                    return Err(());
-                                };
-
-                                if whitespace {
-                                    walk_whitespace(source);
-                                }
-
-                                let undo = source.clone();
-                                let Literal(b')') = Literal::deserialize_over(source, whitespace)? else {
-                                    *source = undo;
-                                    return Err(());
-                                };
-
-                                Some(Packet::PinGetPowerDenied { pin })
-                            },
-                            Field(Literal(b"setPowerDenied")) => {
-                                if whitespace {
-                                    walk_whitespace(source);
-                                }
-
-                                let undo = source.clone();
-                                let Literal(b'(') = Literal::deserialize_over(source, whitespace)? else {
-                                    *source = undo;
-                                    return Err(());
-                                };
-
-                                if whitespace {
-                                    walk_whitespace(source);
-                                }
-
-                                let undo = source.clone();
-                                let Literal(b')') = Literal::deserialize_over(source, whitespace)? else {
-                                    *source = undo;
-                                    return Err(());
-                                };
-
-                                Some(Packet::PinSetPowerDenied { pin })
-                            },
-                            _ => {
-                                *source = undo;
-                                return Err(());
-                            },
-                        }
-                    },
-                    _ => {
-                        *source = undo;
-                        return Err(());
-                    },
-                }
-            },
-            _ => {
-                *source = undo;
-                return Err(());
-            },
-        })
+        Some((name, flags))
     }
 }
