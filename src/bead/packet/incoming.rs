@@ -4,12 +4,16 @@ use crate::bead::{PinFlags, PinMode};
 
 #[derive(Clone, Debug)]
 pub enum Response<'a> {
-    Empty(),
+    Pong { },
     Config { model: &'a str, pins: PinConfigIter<'a> },
-    Power(u16),
-    Mode(PinMode),
-    Flags(PinFlags),
-    NACK { message: &'a str },
+    GetPinPowerResponse { pin: &'a str, power: u16 },
+    GetPinModeResponse { pin: &'a str, mode: PinMode },
+    GetPinFlagsResponse { pin: &'a str, flags: PinFlags },
+    SetPinPowerResponse { pin: &'a str, power: u8 },
+    SetPinModeResponse { pin: &'a str, mode: PinMode },
+    PinChanged { pin: &'a str, power: u16 },
+    PacketError { message: &'a str },
+    DenyError { message: &'a str },
     Panic { line: u32, column: u32, file: &'a str },
 }
 
@@ -30,7 +34,7 @@ pub fn deserialize(payload: &[u8]) -> Result<Response<'_>, Error> {
                 return Err(Error::UnexpectedExcessData);
             };
 
-            Ok(Response::Empty())
+            Ok(Response::Pong { })
         },
         [1, rest @ ..] => {
             let [version, rest @ ..] = rest else {
@@ -62,6 +66,18 @@ pub fn deserialize(payload: &[u8]) -> Result<Response<'_>, Error> {
             Ok(Response::Config { model, pins })
         },
         [2, rest @ ..] => {
+            let [len, rest @ ..] = rest else {
+                return Err(Error::UnexpectedEndOfPacket);
+            };
+
+            let Some((pin, rest)) = rest.split_at_checked(*len as usize) else {
+                return Err(Error::UnexpectedEndOfPacket);
+            };
+
+            let Ok(pin) = str::from_utf8(pin) else {
+                return Err(Error::InvalidUTF8);
+            };
+
             let [byte0, byte1, rest @ ..] = rest else {
                 return Err(Error::UnexpectedEndOfPacket);
             };
@@ -72,14 +88,26 @@ pub fn deserialize(payload: &[u8]) -> Result<Response<'_>, Error> {
                 return Err(Error::UnexpectedExcessData);
             };
 
-            Ok(Response::Power(power))
+            Ok(Response::GetPinPowerResponse { pin, power })
         },
         [3, rest @ ..] => {
-            let [byte, rest @ ..] = rest else {
+            let [len, rest @ ..] = rest else {
                 return Err(Error::UnexpectedEndOfPacket);
             };
 
-            let Ok(mode) = PinMode::try_from(*byte) else {
+            let Some((pin, rest)) = rest.split_at_checked(*len as usize) else {
+                return Err(Error::UnexpectedEndOfPacket);
+            };
+
+            let Ok(pin) = str::from_utf8(pin) else {
+                return Err(Error::InvalidUTF8);
+            };
+
+            let [mode, rest @ ..] = rest else {
+                return Err(Error::UnexpectedEndOfPacket);
+            };
+
+            let Ok(mode) = PinMode::try_from(*mode) else {
                 return Err(Error::InvalidPinMode);
             };
 
@@ -87,14 +115,26 @@ pub fn deserialize(payload: &[u8]) -> Result<Response<'_>, Error> {
                 return Err(Error::UnexpectedExcessData);
             };
 
-            Ok(Response::Mode(mode))
+            Ok(Response::GetPinModeResponse { pin, mode })
         },
         [4, rest @ ..] => {
-            let [byte, rest @ ..] = rest else {
+            let [len, rest @ ..] = rest else {
                 return Err(Error::UnexpectedEndOfPacket);
             };
 
-            let Ok(mode) = PinMode::try_from(*byte) else {
+            let Some((pin, rest)) = rest.split_at_checked(*len as usize) else {
+                return Err(Error::UnexpectedEndOfPacket);
+            };
+
+            let Ok(pin) = str::from_utf8(pin) else {
+                return Err(Error::InvalidUTF8);
+            };
+
+            let [flags, rest @ ..] = rest else {
+                return Err(Error::UnexpectedEndOfPacket);
+            };
+
+            let Some(flags) = PinFlags::from_bits(*flags) else {
                 return Err(Error::InvalidPinMode);
             };
 
@@ -102,9 +142,86 @@ pub fn deserialize(payload: &[u8]) -> Result<Response<'_>, Error> {
                 return Err(Error::UnexpectedExcessData);
             };
 
-            Ok(Response::Mode(mode))
+            Ok(Response::GetPinFlagsResponse { pin, flags })
         },
-        [200, rest @ ..] => {
+        [5, rest @ ..] => {
+            let [len, rest @ ..] = rest else {
+                return Err(Error::UnexpectedEndOfPacket);
+            };
+
+            let Some((pin, rest)) = rest.split_at_checked(*len as usize) else {
+                return Err(Error::UnexpectedEndOfPacket);
+            };
+
+            let Ok(pin) = str::from_utf8(pin) else {
+                return Err(Error::InvalidUTF8);
+            };
+
+            let [power, rest @ ..] = rest else {
+                return Err(Error::UnexpectedEndOfPacket);
+            };
+
+            let power = *power;
+
+            if !rest.is_empty() {
+                return Err(Error::UnexpectedExcessData);
+            };
+
+            Ok(Response::SetPinPowerResponse { pin, power })
+        },
+        [6, rest @ ..] => {
+            let [len, rest @ ..] = rest else {
+                return Err(Error::UnexpectedEndOfPacket);
+            };
+
+            let Some((pin, rest)) = rest.split_at_checked(*len as usize) else {
+                return Err(Error::UnexpectedEndOfPacket);
+            };
+
+            let Ok(pin) = str::from_utf8(pin) else {
+                return Err(Error::InvalidUTF8);
+            };
+
+            let [mode, rest @ ..] = rest else {
+                return Err(Error::UnexpectedEndOfPacket);
+            };
+
+            let Ok(mode) = PinMode::try_from(*mode) else {
+                return Err(Error::InvalidPinMode);
+            };
+
+            if !rest.is_empty() {
+                return Err(Error::UnexpectedExcessData);
+            };
+
+            Ok(Response::SetPinModeResponse { pin, mode })
+        },
+        [7, rest @ ..] => {
+            let [len, rest @ ..] = rest else {
+                return Err(Error::UnexpectedEndOfPacket);
+            };
+
+            let Some((pin, rest)) = rest.split_at_checked(*len as usize) else {
+                return Err(Error::UnexpectedEndOfPacket);
+            };
+
+            let Ok(pin) = str::from_utf8(pin) else {
+                return Err(Error::InvalidUTF8);
+            };
+
+            let [byte0, byte1, rest @ ..] = rest else {
+                return Err(Error::UnexpectedEndOfPacket);
+            };
+
+            let power = u16::from_be_bytes([*byte0, *byte1]);
+
+            if !rest.is_empty() {
+                return Err(Error::UnexpectedExcessData);
+            };
+
+            Ok(Response::PinChanged { pin, power })
+        },
+        [201, rest @ ..] => {
             let [len, rest @ ..] = rest else {
                 return Err(Error::UnexpectedEndOfPacket);
             };
@@ -121,7 +238,26 @@ pub fn deserialize(payload: &[u8]) -> Result<Response<'_>, Error> {
                 return Err(Error::UnexpectedExcessData);
             };
 
-            Ok(Response::NACK { message })
+            Ok(Response::PacketError { message })
+        },
+        [202, rest @ ..] => {
+            let [len, rest @ ..] = rest else {
+                return Err(Error::UnexpectedEndOfPacket);
+            };
+
+            let Some((message, rest)) = rest.split_at_checked(*len as usize) else {
+                return Err(Error::UnexpectedEndOfPacket);
+            };
+
+            let Ok(message) = str::from_utf8(message) else {
+                return Err(Error::InvalidUTF8);
+            };
+
+            if !rest.is_empty() {
+                return Err(Error::UnexpectedExcessData);
+            };
+
+            Ok(Response::PacketError { message })
         },
         [255, rest @ ..] => {
             let [byte0, byte1, byte2, byte3, rest @ ..] = rest else {

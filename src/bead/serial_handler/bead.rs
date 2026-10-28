@@ -3,126 +3,98 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use tokio::io::{self, AsyncWriteExt, BufReader};
-use tokio::sync::{mpsc, oneshot, };
+use tokio::sync::{broadcast, mpsc, oneshot};
 use tokio::time::timeout;
 use tokio_serial::SerialStream;
 
 use crate::bead::{FrameError, PinFlags, PinMode, outgoing, read_frame, surround_frame};
 use crate::bead::packet::incoming;
-use crate::de::Deserialize;
 use crate::log::*;
+
+use super::handler;
 
 #[derive(Debug)]
 pub enum Request {
-    Ping { response: oneshot::Sender<()> },
+    Ping { response: oneshot::Sender<Result<(), &'static str>> },
     GetPinPower { pin: Arc<str>, response: oneshot::Sender<Result<f32, &'static str>> },
     GetPinMode { pin: Arc<str>, response: oneshot::Sender<Result<PinMode, &'static str>> },
     GetPinFlags { pin: Arc<str>, response: oneshot::Sender<Result<PinFlags, &'static str>> },
-    SetPower { pin: Arc<str>, power: f32, response: oneshot::Sender<Result<f32, &'static str>> },
-    SetMode { pin: Arc<str>, mode: PinMode, response: oneshot::Sender<Result<PinMode, &'static str>> },
+    SetPinPower { pin: Arc<str>, power: f32, response: oneshot::Sender<Result<f32, &'static str>> },
+    SetPinMode { pin: Arc<str>, mode: PinMode, response: oneshot::Sender<Result<PinMode, &'static str>> },
 }
 
 #[derive(Clone, Debug)]
-pub struct BeadInfo {
+pub struct Info {
     model: Arc<str>,
-    pins: Vec<(Arc<str>, PinFlags)>,
+    pins: Arc<[(Arc<str>, PinFlags)]>,
 }
 
 #[derive(Clone, Debug)]
-pub enum BeadError<T = Infallible> {
+pub enum Error<T = Infallible> {
     FailedToInit { message: &'static str },
     Other(T),
 }
 
-impl<T> From<T> for BeadError<T> {
-    fn from(value: T) -> Self { BeadError::Other(value) }
+impl<T> From<T> for Error<T> {
+    fn from(value: T) -> Self { Error::Other(value) }
 }
 
 const MAX_POWER_READ: u16 = 1023;
 const MAX_POWER_WRITE: u8 = 255;
 
-pub async fn handle_serial(serial: SerialStream)
-    -> Result<(mpsc::Sender<Request>, BeadInfo), (SerialStream, BeadError<io::Error>)> {
+pub(super) async fn handle_serial(
+    bead: &Arc<str>,
+    serial: SerialStream,
+    events: &broadcast::Sender<handler::Event>)
+    -> Result<(Info, mpsc::Sender<Request>), (SerialStream, Error<io::Error>)>
+{
     let mut serial = BufReader::new(serial);
     let mut buffer = heapless::Deque::new();
     let mut info = None;
-    'ping_attempt: for _ in 0..20 {
-        outgoing::serialize(&outgoing::Request::Ping { }, &mut buffer);
+    'init: for _ in 0..20 {
+        outgoing::serialize(&outgoing::Request::GetConfig { }, &mut buffer);
         surround_frame(&mut buffer);
 
         if let Err(error) = serial.write_all(buffer.make_contiguous()).await {
-            return Err((serial.into_inner(), BeadError::Other(error)));
+            return Err((serial.into_inner(), Error::Other(error)));
         };
 
         match timeout(Duration::from_millis(200), read_frame(&mut serial, &mut buffer)).await {
             Err(_) => {
                 buffer.clear();
-                continue 'ping_attempt;
+                continue 'init;
             },
             Ok(Err(FrameError::NotMagic)) => {
                 _ = buffer.pop_front();
-                continue 'ping_attempt;
+                continue 'init;
             },
             Ok(Err(FrameError::ChecksumMismatch)) => {
                 buffer.clear();
-                continue 'ping_attempt;
+                continue 'init;
             },
             Ok(Err(FrameError::FromRead(error))) => {
-                return Err((serial.into_inner(), BeadError::Other(error)));
+                eprintln!("{Error} Failed to receive packet from bead: {error}.");
+                return Err((serial.into_inner(), Error::Other(error)));
             },
             Ok(Ok(payload)) => {
                 match incoming::deserialize(payload) {
-                    Ok(incoming::Response::Empty()) => {
-                        'config_attempt: loop {
-                            outgoing::serialize(&outgoing::Request::GetConfig { }, &mut buffer);
-                            surround_frame(&mut buffer);
-
-                            if let Err(error) = serial.write_all(buffer.make_contiguous()).await {
-                                return Err((serial.into_inner(), BeadError::Other(error)));
-                            };
-
-                            'and_ignore: loop {
-                                match timeout(Duration::from_millis(200), read_frame(&mut serial, &mut buffer)).await {
-                                    Err(_) => {
-                                        buffer.clear();
-                                        continue 'config_attempt;
-                                    },
-                                    Ok(Err(FrameError::NotMagic)) => {
-                                        _ = buffer.pop_front();
-                                        continue 'config_attempt;
-                                    },
-                                    Ok(Err(FrameError::ChecksumMismatch)) => {
-                                        buffer.clear();
-                                        continue 'config_attempt;
-                                    },
-                                    Ok(Err(FrameError::FromRead(error))) => {
-                                        return Err((serial.into_inner(), BeadError::Other(error)));
-                                    },
-                                    Ok(Ok(payload)) => {
-                                        match incoming::deserialize(payload) {
-                                            Ok(incoming::Response::Config { model, pins }) => {
-                                                let model = Arc::from(model);
-                                                let pins = pins.map(|(name, flags)| (Arc::from(name), flags)).collect();
-                                                info = Some(BeadInfo { model, pins });
-                                                break;
-                                            },
-                                            Ok(incoming::Response::Empty()) => {
-                                                // Clear out any slow pongs.
-                                                continue 'and_ignore;
-                                            },
-                                            _ => {
-                                                continue 'config_attempt;
-                                            },
-                                        }
-                                    },
-                                }
-                            }
-                            break;
-                        }
-                        break;
+                    Ok(incoming::Response::Config { model, pins }) => {
+                        info = Some(Info {
+                            model: Arc::from(model),
+                            pins: Arc::from_iter(pins.map(|(name, flags)| (Arc::from(name), flags))),
+                        });
+                        break 'init;
+                    },
+                    Ok(incoming::Response::DenyError { message }) => {
+                        eprintln!("{Error} Bead denied init: {message}.");
+                        return Err((serial.into_inner(), Error::FailedToInit { message: "Denied" }));
+                    },
+                    Ok(incoming::Response::Panic { line, column, file }) => {
+                        eprintln!("{Error} Bead panicked at {file}:{line}:{column}.");
+                        return Err((serial.into_inner(), Error::FailedToInit { message: "Panicked" }));
                     },
                     _ => {
-                        continue 'ping_attempt;
+                        continue 'init;
                     },
                 }
             },
@@ -130,16 +102,22 @@ pub async fn handle_serial(serial: SerialStream)
     }
 
     let Some(info) = info else {
-        return Err((serial.into_inner(), BeadError::FailedToInit { message: "Too many attempts" }));
+        eprintln!("{Error} Bead init failed too many attempts.");
+        return Err((serial.into_inner(), Error::FailedToInit { message: "Failed too many attempts" }));
     };
 
     let (tx, mut rx) = mpsc::channel(1);
 
-    
+    let bead = bead.clone();
+    let events = events.clone();
+    let result_info = info.clone();
+
+    events.send(handler::Event::Opened { bead: bead.clone(), info: info.clone() });
+
     tokio::spawn(async move {
         const RETRY_DELAY: Duration = Duration::from_millis(200);
 
-        while let Some(request) = rx.recv().await {
+        'and_close: while let Some(request) = rx.recv().await {
             match request {
                 Request::Ping { response } => {
                     'attempt: loop {
@@ -147,7 +125,8 @@ pub async fn handle_serial(serial: SerialStream)
                         surround_frame(&mut buffer);
 
                         if let Err(error) = serial.write_all(buffer.make_contiguous()).await {
-                            eprintln!("{Error} Failed to send packet to bead: {error}");
+                            eprintln!("{Error} Failed to send packet to bead: {error}.");
+                            break 'and_close;
                         };
 
                         match timeout(RETRY_DELAY, read_frame(&mut serial, &mut buffer)).await {
@@ -164,13 +143,39 @@ pub async fn handle_serial(serial: SerialStream)
                                 continue 'attempt;
                             },
                             Ok(Err(FrameError::FromRead(error))) => {
-                                eprintln!("{Error} Failed to send packet to bead: {error}");
+                                eprintln!("{Error} Failed to receive packet from bead: {error}.");
+                                break 'and_close;
                             },
                             Ok(Ok(payload)) => {
                                 match incoming::deserialize(payload) {
-                                    Ok(incoming::Response::Empty()) => {
-                                        _ = response.send(());
+                                    Ok(incoming::Response::Pong { }) => {
+                                        _ = response.send(Ok(()));
                                         break 'attempt;
+                                    },
+                                    Ok(incoming::Response::DenyError { message }) => {
+                                        eprintln!("{Warn} Bead denied get pin power: {message}.");
+                                        _ = response.send(Err(match message {
+                                            "Invalid pin id" => "Invalid pin id",
+                                            _ => "Denied get pin power",
+                                        }));
+                                        break 'attempt;
+                                    },
+                                    Ok(incoming::Response::Panic { line, column, file }) => {
+                                        eprintln!("{Error} Bead panicked at {file}:{line}:{column}.");
+                                        _ = response.send(Err("Panicked"));
+                                        break 'and_close;
+                                    },
+                                    Ok(incoming::Response::PinChanged { pin, power }) => {
+                                        if let Some((name, _)) = info.pins.iter().find(|(name, _)| **name == *pin) {
+                                            _ = events.send(handler::Event::PinListen {
+                                                bead: bead.clone(),
+                                                pin: name.clone(),
+                                                power: power as f32 / MAX_POWER_READ as f32,
+                                            });
+                                        } else {
+                                            eprintln!("{Warn} Bead sent event for unknown pin.");
+                                        }
+                                        continue 'attempt;
                                     },
                                     _ => {
                                         continue 'attempt;
@@ -187,7 +192,8 @@ pub async fn handle_serial(serial: SerialStream)
                         surround_frame(&mut buffer);
 
                         if let Err(error) = serial.write_all(buffer.make_contiguous()).await {
-                            eprintln!("{Error} Failed to send packet to bead: {error}");
+                            eprintln!("{Error} Failed to send packet to bead: {error}.");
+                            break 'and_close;
                         };
 
                         match timeout(RETRY_DELAY, read_frame(&mut serial, &mut buffer)).await {
@@ -204,24 +210,40 @@ pub async fn handle_serial(serial: SerialStream)
                                 continue 'attempt;
                             },
                             Ok(Err(FrameError::FromRead(error))) => {
-                                eprintln!("{Error} Failed to send packet to bead: {error}");
+                                eprintln!("{Error} Failed to receive packet from bead: {error}.");
+                                break 'and_close;
                             },
                             Ok(Ok(payload)) => {
                                 match incoming::deserialize(payload) {
-                                    Ok(incoming::Response::Power(power)) => {
-                                        _ = response.send(Ok(match power {
-                                            MAX_POWER_READ.. => 1.0,
-                                            x => x as f32 / MAX_POWER_READ as f32,
+                                    Ok(incoming::Response::GetPinPowerResponse { pin: response_pin, power })
+                                    if *response_pin == **pin => {
+                                        _ = response.send(Ok(power.min(MAX_POWER_READ) as f32 / MAX_POWER_READ as f32));
+                                        break 'attempt;
+                                    },
+                                    Ok(incoming::Response::DenyError { message }) => {
+                                        eprintln!("{Warn} Bead denied get pin power: {message}.");
+                                        _ = response.send(Err(match message {
+                                            "Invalid pin id" => "Invalid pin id",
+                                            _ => "Denied get pin power",
                                         }));
                                         break 'attempt;
                                     },
-                                    Ok(incoming::Response::NACK { message: "Invalid pin id" }) => {
-                                        _ = response.send(Err("Invalid pin id"));
-                                        break 'attempt;
+                                    Ok(incoming::Response::Panic { line, column, file }) => {
+                                        eprintln!("{Error} Bead panicked at {file}:{line}:{column}.");
+                                        _ = response.send(Err("Panicked"));
+                                        break 'and_close;
                                     },
-                                    Ok(incoming::Response::NACK { message: "Denied get pin power" }) => {
-                                        _ = response.send(Err("Denied get pin power"));
-                                        break 'attempt;
+                                    Ok(incoming::Response::PinChanged { pin, power }) => {
+                                        if let Some((name, _)) = info.pins.iter().find(|(name, _)| **name == *pin) {
+                                            _ = events.send(handler::Event::PinListen {
+                                                bead: bead.clone(),
+                                                pin: name.clone(),
+                                                power: power as f32 * MAX_POWER_READ as f32,
+                                            });
+                                        } else {
+                                            eprintln!("{Warn} Bead sent event for unknown pin.");
+                                        }
+                                        continue 'attempt;
                                     },
                                     _ => {
                                         continue 'attempt;
@@ -238,7 +260,8 @@ pub async fn handle_serial(serial: SerialStream)
                         surround_frame(&mut buffer);
 
                         if let Err(error) = serial.write_all(buffer.make_contiguous()).await {
-                            eprintln!("{Error} Failed to send packet to bead: {error}");
+                            eprintln!("{Error} Failed to send packet to bead: {error}.");
+                            break 'and_close;
                         };
 
                         match timeout(RETRY_DELAY, read_frame(&mut serial, &mut buffer)).await {
@@ -255,21 +278,40 @@ pub async fn handle_serial(serial: SerialStream)
                                 continue 'attempt;
                             },
                             Ok(Err(FrameError::FromRead(error))) => {
-                                eprintln!("{Error} Failed to send packet to bead: {error}");
+                                eprintln!("{Error} Failed to receive packet from bead: {error}.");
+                                break 'and_close;
                             },
                             Ok(Ok(payload)) => {
                                 match incoming::deserialize(payload) {
-                                    Ok(incoming::Response::Mode(mode)) => {
+                                    Ok(incoming::Response::GetPinModeResponse { pin: response_pin, mode })
+                                    if *response_pin == **pin => {
                                         _ = response.send(Ok(mode));
                                         break 'attempt;
                                     },
-                                    Ok(incoming::Response::NACK { message: "Invalid pin id" }) => {
-                                        _ = response.send(Err("Invalid pin id"));
+                                    Ok(incoming::Response::DenyError { message }) => {
+                                        eprintln!("{Warn} Bead denied get pin mode: {message}.");
+                                        _ = response.send(Err(match message {
+                                            "Invalid pin id" => "Invalid pin id",
+                                            _ => "Denied get pin mode",
+                                        }));
                                         break 'attempt;
                                     },
-                                    Ok(incoming::Response::NACK { message: "Denied get pin mode" }) => {
-                                        _ = response.send(Err("Denied get pin mode"));
-                                        break 'attempt;
+                                    Ok(incoming::Response::Panic { line, column, file }) => {
+                                        eprintln!("{Error} Bead panicked at {file}:{line}:{column}.");
+                                        _ = response.send(Err("Panicked"));
+                                        break 'and_close;
+                                    },
+                                    Ok(incoming::Response::PinChanged { pin, power }) => {
+                                        if let Some((name, _)) = info.pins.iter().find(|(name, _)| **name == *pin) {
+                                            _ = events.send(handler::Event::PinListen {
+                                                bead: bead.clone(),
+                                                pin: name.clone(),
+                                                power: power as f32 * MAX_POWER_READ as f32,
+                                            });
+                                        } else {
+                                            eprintln!("{Warn} Bead sent event for unknown pin.");
+                                        }
+                                        continue 'attempt;
                                     },
                                     _ => {
                                         continue 'attempt;
@@ -286,7 +328,8 @@ pub async fn handle_serial(serial: SerialStream)
                         surround_frame(&mut buffer);
 
                         if let Err(error) = serial.write_all(buffer.make_contiguous()).await {
-                            eprintln!("{Error} Failed to send packet to bead: {error}");
+                            eprintln!("{Error} Failed to send packet to bead: {error}.");
+                            break 'and_close;
                         };
 
                         match timeout(RETRY_DELAY, read_frame(&mut serial, &mut buffer)).await {
@@ -303,21 +346,40 @@ pub async fn handle_serial(serial: SerialStream)
                                 continue 'attempt;
                             },
                             Ok(Err(FrameError::FromRead(error))) => {
-                                eprintln!("{Error} Failed to send packet to bead: {error}");
+                                eprintln!("{Error} Failed to receive packet from bead: {error}.");
+                                break 'and_close;
                             },
                             Ok(Ok(payload)) => {
                                 match incoming::deserialize(payload) {
-                                    Ok(incoming::Response::Flags(flags)) => {
+                                    Ok(incoming::Response::GetPinFlagsResponse { pin: response_pin, flags })
+                                    if *response_pin == **pin => {
                                         _ = response.send(Ok(flags));
                                         break 'attempt;
                                     },
-                                    Ok(incoming::Response::NACK { message: "Invalid pin id" }) => {
-                                        _ = response.send(Err("Invalid pin id"));
+                                    Ok(incoming::Response::DenyError { message }) => {
+                                        eprintln!("{Warn} Bead denied get pin flags: {message}.");
+                                        _ = response.send(Err(match message {
+                                            "Invalid pin id" => "Invalid pin id",
+                                            _ => "Denied get pin flags",
+                                        }));
                                         break 'attempt;
                                     },
-                                    Ok(incoming::Response::NACK { message: "Denied get pin flags" }) => {
-                                        _ = response.send(Err("Denied get pin flags"));
-                                        break 'attempt;
+                                    Ok(incoming::Response::Panic { line, column, file }) => {
+                                        eprintln!("{Error} Bead panicked at {file}:{line}:{column}.");
+                                        _ = response.send(Err("Panicked"));
+                                        break 'and_close;
+                                    },
+                                    Ok(incoming::Response::PinChanged { pin, power }) => {
+                                        if let Some((name, _)) = info.pins.iter().find(|(name, _)| **name == *pin) {
+                                            _ = events.send(handler::Event::PinListen {
+                                                bead: bead.clone(),
+                                                pin: name.clone(),
+                                                power: power as f32 * MAX_POWER_READ as f32,
+                                            });
+                                        } else {
+                                            eprintln!("{Warn} Bead sent event for unknown pin.");
+                                        }
+                                        continue 'attempt;
                                     },
                                     _ => {
                                         continue 'attempt;
@@ -327,7 +389,7 @@ pub async fn handle_serial(serial: SerialStream)
                         }
                     }
                 },
-                Request::SetPower { pin, power, response } => {
+                Request::SetPinPower { pin, power, response } => {
                     'attempt: loop {
                         let pin = &pin;
                         let power = (power * MAX_POWER_WRITE as f32) as u8;
@@ -335,7 +397,8 @@ pub async fn handle_serial(serial: SerialStream)
                         surround_frame(&mut buffer);
 
                         if let Err(error) = serial.write_all(buffer.make_contiguous()).await {
-                            eprintln!("{Error} Failed to send packet to bead: {error}");
+                            eprintln!("{Error} Failed to send packet to bead: {error}.");
+                            break 'and_close;
                         };
 
                         match timeout(RETRY_DELAY, read_frame(&mut serial, &mut buffer)).await {
@@ -352,24 +415,40 @@ pub async fn handle_serial(serial: SerialStream)
                                 continue 'attempt;
                             },
                             Ok(Err(FrameError::FromRead(error))) => {
-                                eprintln!("{Error} Failed to send packet to bead: {error}");
+                                eprintln!("{Error} Failed to receive packet from bead: {error}.");
+                                break 'and_close;
                             },
                             Ok(Ok(payload)) => {
                                 match incoming::deserialize(payload) {
-                                    Ok(incoming::Response::Power(power)) => {
-                                        _ = response.send(Ok(match power {
-                                            MAX_POWER_READ.. => 1.0,
-                                            x => x as f32 / MAX_POWER_READ as f32,
+                                    Ok(incoming::Response::SetPinPowerResponse { pin: response_pin, power })
+                                    if *response_pin == **pin => {
+                                        _ = response.send(Ok(power.min(MAX_POWER_WRITE) as f32 / MAX_POWER_WRITE as f32));
+                                        break 'attempt;
+                                    },
+                                    Ok(incoming::Response::DenyError { message }) => {
+                                        eprintln!("{Warn} Bead denied set pin power: {message}.");
+                                        _ = response.send(Err(match message {
+                                            "Invalid pin id" => "Invalid pin id",
+                                            _ => "Denied set pin power",
                                         }));
                                         break 'attempt;
                                     },
-                                    Ok(incoming::Response::NACK { message: "Invalid pin id" }) => {
-                                        _ = response.send(Err("Invalid pin id"));
-                                        break 'attempt;
+                                    Ok(incoming::Response::Panic { line, column, file }) => {
+                                        eprintln!("{Error} Bead panicked at {file}:{line}:{column}.");
+                                        _ = response.send(Err("Panicked"));
+                                        break 'and_close;
                                     },
-                                    Ok(incoming::Response::NACK { message: "Denied set pin power" }) => {
-                                        _ = response.send(Err("Denied set pin power"));
-                                        break 'attempt;
+                                    Ok(incoming::Response::PinChanged { pin, power }) => {
+                                        if let Some((name, _)) = info.pins.iter().find(|(name, _)| **name == *pin) {
+                                            _ = events.send(handler::Event::PinListen {
+                                                bead: bead.clone(),
+                                                pin: name.clone(),
+                                                power: power as f32 * MAX_POWER_READ as f32,
+                                            });
+                                        } else {
+                                            eprintln!("{Warn} Bead sent event for unknown pin.");
+                                        }
+                                        continue 'attempt;
                                     },
                                     _ => {
                                         continue 'attempt;
@@ -379,14 +458,15 @@ pub async fn handle_serial(serial: SerialStream)
                         }
                     }
                 },
-                Request::SetMode { pin, mode, response } => {
+                Request::SetPinMode { pin, mode, response } => {
                     'attempt: loop {
                         let pin = &pin;
                         outgoing::serialize(&outgoing::Request::SetPinMode { pin, mode }, &mut buffer);
                         surround_frame(&mut buffer);
 
                         if let Err(error) = serial.write_all(buffer.make_contiguous()).await {
-                            eprintln!("{Error} Failed to send packet to bead: {error}");
+                            eprintln!("{Error} Failed to send packet to bead: {error}.");
+                            break 'and_close;
                         };
 
                         match timeout(RETRY_DELAY, read_frame(&mut serial, &mut buffer)).await {
@@ -403,21 +483,40 @@ pub async fn handle_serial(serial: SerialStream)
                                 continue 'attempt;
                             },
                             Ok(Err(FrameError::FromRead(error))) => {
-                                eprintln!("{Error} Failed to send packet to bead: {error}");
+                                eprintln!("{Error} Failed to receive packet from bead: {error}.");
+                                break 'and_close;
                             },
                             Ok(Ok(payload)) => {
                                 match incoming::deserialize(payload) {
-                                    Ok(incoming::Response::Mode(mode)) => {
+                                    Ok(incoming::Response::SetPinModeResponse { pin: response_pin, mode })
+                                    if *response_pin == **pin => {
                                         _ = response.send(Ok(mode));
                                         break 'attempt;
                                     },
-                                    Ok(incoming::Response::NACK { message: "Invalid pin id" }) => {
-                                        _ = response.send(Err("Invalid pin id"));
+                                    Ok(incoming::Response::DenyError { message }) => {
+                                        eprintln!("{Warn} Bead denied set pin mode: {message}.");
+                                        _ = response.send(Err(match message {
+                                            "Invalid pin id" => "Invalid pin id",
+                                            _ => "Denied set pin mode",
+                                        }));
                                         break 'attempt;
                                     },
-                                    Ok(incoming::Response::NACK { message: "Denied set pin mode" }) => {
-                                        _ = response.send(Err("Denied set pin mode"));
-                                        break 'attempt;
+                                    Ok(incoming::Response::Panic { line, column, file }) => {
+                                        eprintln!("{Error} Bead panicked at {file}:{line}:{column}.");
+                                        _ = response.send(Err("Panicked"));
+                                        break 'and_close;
+                                    },
+                                    Ok(incoming::Response::PinChanged { pin, power }) => {
+                                        if let Some((name, _)) = info.pins.iter().find(|(name, _)| **name == *pin) {
+                                            _ = events.send(handler::Event::PinListen {
+                                                bead: bead.clone(),
+                                                pin: name.clone(),
+                                                power: power as f32 * MAX_POWER_READ as f32,
+                                            });
+                                        } else {
+                                            eprintln!("{Warn} Bead sent event for unknown pin.");
+                                        }
+                                        continue 'attempt;
                                     },
                                     _ => {
                                         continue 'attempt;
@@ -429,7 +528,9 @@ pub async fn handle_serial(serial: SerialStream)
                 },
             }
         }
+
+        events.send(handler::Event::Closed { bead: bead.clone() });
     });
 
-    Ok((tx, info))
+    Ok((result_info, tx))
 }

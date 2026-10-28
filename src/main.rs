@@ -1,5 +1,5 @@
 use axum::routing;
-use bead::SerialHandler;
+use bead::handler;
 use router::Router;
 use tokio::time::interval;
 use tokio::{select, signal};
@@ -11,8 +11,6 @@ use std::sync::Arc;
 use std::time::Duration;
 
 mod args;
-
-mod de;
 
 mod bead;
 
@@ -106,7 +104,7 @@ async fn main() {
                 listener,
                 routing::Router::from(Router {
                     config_name: berry_name,
-                    serial_handler: Arc::new(SerialHandler::new()),
+                    serial_handler: Arc::new(handler::Handler::new()),
                 }))
                 .with_graceful_shutdown(shutdown_signal())
                 .await
